@@ -71,7 +71,6 @@ def get_iterator(args):
         lines = fp.read().split("\n")
         root = lines.pop(0).strip()
         files = [osp.join(root, line.split("\t")[0]) for line in lines if len(line) > 0]
-
         num = len(files)
         reader = Wav2VecFeatureReader(args.checkpoint, args.layer)
 

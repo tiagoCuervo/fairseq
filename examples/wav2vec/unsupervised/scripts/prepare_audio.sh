@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/bin/bash
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -30,17 +30,19 @@ train_split=train
 valid_split=valid
 test_split=test
 
-all_splits=($train_split)
+all_splits=$train_split
 
-if [[ -f "$source_dir/valid.tsv" ]]; then
-    all_splits+=('valid')
+if [ -f "$source_dir/valid.tsv" ]; then
+    echo "Found $source_dir/valid.tsv"
+    all_splits="$all_splits valid"
 fi
 
-if [[ -f "$source_dir/test.tsv" ]]; then
-    all_splits+=('test')
+if [ -f "$source_dir/test.tsv" ]; then
+    echo "Found $source_dir/test.tsv"
+    all_splits="$all_splits test"
 fi
 
-echo "processing splits: $all_splits"
+echo "processing splits: $all_splits, found in $source_dir"
 
 mkdir -p $tgt_dir
 
@@ -49,8 +51,6 @@ cp $source_dir/*.wrd $tgt_dir
 cp $source_dir/*.ltr $tgt_dir
 cp $source_dir/*.phn $tgt_dir
 cp $source_dir/dict* $tgt_dir
-
-setopt shwordsplit
 
 for split in $all_splits; do
   python $FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/wav2vec_extract_features.py $source_dir --split $split \

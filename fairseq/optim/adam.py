@@ -36,6 +36,9 @@ class FairseqAdamConfig(FairseqDataclass):
     fp16_adam_stats: bool = field(
         default=False, metadata={"help": "use FP16 stats (with automatic scaling)"}
     )
+    amsgrad: bool = field(
+        default=False, metadata={"help": "whether to use the AMSGrad variant of this algorithm"}
+    )
     # TODO common vars below in parent
     tpu: bool = II("common.tpu")
     lr: List[float] = II("optimization.lr")
