@@ -118,37 +118,3 @@ model:
     type: JOIN
     mean_pool_join: false
     remove_zeros: false
-
-
-hydra:
-  job:
-    config:
-      override_dirname:
-        kv_sep: ':'
-        item_sep: '__'
-        exclude_keys:
-          - run_config
-          - distributed_training.distributed_port
-          - common.user_dir
-          - task.data
-          - task.kenlm_path
-          - task.text_data
-          - model.generator_layers
-          - task.labels
-          - task.force_model_seed
-  sweep:
-    dir: /checkpoint/${env:USER}/${env:PREFIX}/${hydra.job.config_name}/${hydra.job.override_dirname}
-    subdir: ${hydra.job.num}
-  launcher:
-    submitit_folder: ${hydra.sweep.dir}
-    timeout_min: 3000
-    cpus_per_task: 10
-    gpus_per_node: 1
-    tasks_per_node: 1
-    mem_gb: 120
-    nodes: 1
-    name: ${env:PREFIX}_${hydra.job.config_name}
-    partition: devlab,learnlab,learnfair,scavenge
-    comment: intern_endding_soon
-    constraint: volta32gb
-    max_num_timeout: 30
