@@ -224,39 +224,6 @@ class UniformRandomJoinSegmenter(UniformRandomSegmenter, JoinSegmenter):
     pass
 
 
-class PiGradSegmenter(Segmenter):
-    def __init__(self, cfg: SegmentationConfig):
-        super(PiGradSegmenter, self).__init__(cfg)
-        encoder = TransformerEncoder
-        if self.cfg.layer_type == "conformer" and self.cfg.pos_enc_type in ["rel_pos", "rope"]:
-            encoder = ConformerEncoder
-        self.encoder = encoder(self.cfg)
-        self.policy = nn.Linear(self.cfg.encoder_embed_dim, 2)
-        self.minSegmentWidth = 1
-        self.boundaryLogProbs = None
-    
-    def forward(self, x, paddingMask):
-        bs, l, _ = x.size()
-        x, _ = self.encoder(x, padding_mask=paddingMask)
-        x = self.policy(x)
-        noBoundaryFlag = torch.zeros((bs, 1), device=x.device)
-        for i in range(l):
-            x[noBoundaryFlag.view(-1) > 0, i, 1] += -1e4
-            boundaryPreds = torch.argmax(x[:, i, :], dim=-1)
-            noBoundaryFlag[noBoundaryFlag > 0] -= 1
-            noBoundaryFlag[boundaryPreds > 0] = self.minSegmentWidth
-        self.boundaryLogProbs = torch.log_softmax(x, dim=-1)
-        if self.training:
-            boundaries = torch.multinomial(torch.exp(self.boundaryLogProbs).view(bs * l, -1), 1).view(bs, l).float()
-        else:
-            boundaries = torch.argmax(self.boundaryLogProbs, dim=-1)
-        return boundaries, torch.gather(self.boundaryLogProbs, -1, boundaries.unsqueeze(2).long())
-
-    def forward(self, x, paddingMask):
-        x, _ = self.encoder(x, padding_mask=paddingMask)
-        x = self.policy(x)
-
-
 SEGMENT_FACTORY = {
     SegmentationType.NONE: Segmenter,
     SegmentationType.RANDOM: RandomSegmenter,
