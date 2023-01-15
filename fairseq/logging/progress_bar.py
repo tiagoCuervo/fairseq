@@ -417,6 +417,11 @@ def _close_writers():
         w.close()
 
 
+def clear_tb_writers():
+    _close_writers()
+    _tensorboard_writers.clear()
+
+
 atexit.register(_close_writers)
 
 

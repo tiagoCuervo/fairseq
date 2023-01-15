@@ -128,6 +128,7 @@ data-bin/
 # VSCODE
 .vscode/ftp-sync.json
 .vscode/settings.json
+.vscode/launch.json
 
 # Experimental Folder
 experimental/*

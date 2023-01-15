@@ -11,11 +11,12 @@ import sys
 
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 from omegaconf import MISSING, II, OmegaConf
 
 from fairseq.data import BinarizedAudioDataset, FileAudioDataset
 from fairseq.dataclass import FairseqDataclass, ChoiceEnum
+from fairseq.dataclass.configs import GenerationConfig
 from fairseq.data.text_compressor import TextCompressionLevel
 
 from . import FairseqTask, register_task
@@ -48,6 +49,30 @@ class InferredW2vConfig:
 @dataclass
 class AudioPretrainingConfig(FairseqDataclass):
     data: str = field(default=MISSING, metadata={"help": "path to data directory"})
+    eval_wer: bool = field(
+        default=False, metadata={"help": "compute WER for Seq2Seq models"}
+    )
+    eval_wer_config: GenerationConfig = field(
+        default_factory=lambda: GenerationConfig(),
+        metadata={"help": "beam search config for evaluating wer during training"},
+    )
+    eval_wer_tokenizer: Any = field(
+        default=None,
+        metadata={"help": "tokenizer config for evaluating wer during training"},
+    )
+    eval_wer_post_process: str = field(
+        default="letter",
+        metadata={
+            "help": "remove BPE tokens before scoring (can be sentencepiece, letter, and more)"
+        },
+    )
+    autoregressive: bool = field(
+        default=False,
+        metadata={
+            "help": "required for autoregressive decoders (like seq2seq models); "
+            "adds 'prev_output_tokens' to input and appends eos to target"
+        },
+    )
     labels: Optional[str] = field(
         default=None,
         metadata={"help": "extension of the label file to load, used for fine-tuning"},
