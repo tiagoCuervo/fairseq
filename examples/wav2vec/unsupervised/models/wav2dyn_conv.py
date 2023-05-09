@@ -21,9 +21,10 @@ from fairseq.modules import (
     SamePad,
     TransposeLast,
 )
-
-from fairseq.models.wav2vec import TransformerEncoder, ConformerEncoder
-
+from .lm import ConvLM
+from omegaconf import MISSING
+# import matplotlib.pyplot as plt
+import os
 
 class SegmentationType(Enum):
     NONE = auto()
@@ -44,6 +45,8 @@ class SegmentationConfig(FairseqDataclass):
 
 @dataclass
 class Wav2vec_UConfig(FairseqDataclass):
+    log_gradients: bool = False 
+    
     discriminator_kernel: int = 3
     discriminator_dilation: int = 1
     discriminator_dim: int = 256
@@ -64,26 +67,8 @@ class Wav2vec_UConfig(FairseqDataclass):
     generator_dropout: float = 0.0
     generator_batch_norm: int = 0
     generator_residual: bool = False
-    generator_dyn_pool: bool = True
-    # Boundary predictor config 
-    encoder_embed_dim: int = 1024
-    encoder_ffn_embed_dim: int = 2048
-    encoder_attention_heads: int = 8
-    dropout: float = 0.1
-    attention_dropout: float = 0.1
-    activation_dropout: float = 0.1
-    activation_fn: str = "relu"
-    layer_norm_first: bool = False
-    layer_type: str = "transformer"
-    attn_type: str = ""
-    pos_enc_type: str = "abs"
-    encoder_layers: int = 2
-    required_seq_len_multiple: int = 2
-    conv_pos: int = 128
-    conv_pos_groups: int = 16
-    pos_conv_depth: int = 1
-    encoder_layerdrop: float = 0.0
-    checkpoint_activations: bool = False
+
+    lm_ckpt: str = MISSING
 
     blank_weight: float = 0
     blank_mode: str = "add"
@@ -103,8 +88,6 @@ class Wav2vec_UConfig(FairseqDataclass):
     hard_gumbel: bool = True
     temp: Tuple[float, float, float] = (2, 0.1, 0.99995)
     input_dim: int = 128
-    pigrad_weight: float = 1.0
-    len_prior_weight: float = 0.0
 
     segmentation: SegmentationConfig = SegmentationConfig()
 
@@ -229,7 +212,7 @@ SEGMENT_FACTORY = {
     SegmentationType.RANDOM: RandomSegmenter,
     SegmentationType.UNIFORM_RANDOM: UniformRandomSegmenter,
     SegmentationType.UNIFORM_RANDOM_JOIN: UniformRandomJoinSegmenter,
-    SegmentationType.JOIN: JoinSegmenter
+    SegmentationType.JOIN: JoinSegmenter,
 }
 
 
@@ -309,54 +292,6 @@ class Discriminator(nn.Module):
         return x
 
 
-AVG_PHONE_DURATION = 3.790364
-
-
-class BoundaryPredictor(nn.Module):
-    def __init__(self, cfg: Wav2vec_UConfig):
-        super().__init__()
-        encoder = TransformerEncoder
-        if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
-            encoder = ConformerEncoder
-        self.proj = encoder(cfg)
-        self.predictor = nn.Linear(cfg.encoder_embed_dim, 2)
-
-    def forward(self, x):
-        bs, l, _ = x.size()
-        x, _ = self.proj(x)
-        x = self.predictor(x)
-        boundary_log_probs = torch.log_softmax(x, dim=-1)
-        if self.training:
-            boundaries = torch.multinomial(torch.exp(boundary_log_probs).view(bs * l, -1), 1).view(bs, l).float()
-        else:
-            boundaries = torch.argmax(boundary_log_probs, dim=-1)
-        return boundaries, boundary_log_probs
- 
-
-def downsample_by_boundaries(x, boundary_indicators):
-    boundaries =  torch.nonzero(boundary_indicators.view(-1), as_tuple=True)[0]
-    orig_length = x.size(1)
-    # Ensure that minibatch boundaries are preserved
-    seqEndIdx = torch.arange(0, x.size(0)*x.size(1) + 1, x.size(1), device=x.device)
-    boundaries = torch.unique(torch.cat((boundaries, seqEndIdx)), sorted=True)
-    # Compute compression matrices
-    cutpoints = torch.nonzero((boundaries % orig_length) == 0)
-    seqIdx = torch.nn.utils.rnn.pad_sequence(
-        torch.split(boundaries[1:] % orig_length, tuple(cutpoints[1:]-cutpoints[:-1])), batch_first=True)
-    seqIdx[seqIdx==0] = orig_length
-    seqIdx = F.pad(seqIdx, (1,0,0,0)).to(device=x.device)
-    frame_idxs = torch.arange(orig_length, device=x.device).view(1, 1, -1)
-    compress_matrices = (
-        (seqIdx[:,:-1, None] <= frame_idxs)
-        & (seqIdx[:,1:, None] > frame_idxs)
-    ).float()
-    # Average pool
-    assert compress_matrices.shape[0] == x.shape[0]
-    denom = torch.maximum(compress_matrices.sum(-1, keepdim=True), torch.ones(1, device=compress_matrices.device))
-    avg_pooled_x = torch.bmm(compress_matrices / denom, x)
-    return avg_pooled_x
-
-
 class Generator(nn.Module):
     def __init__(self, input_dim, output_dim, cfg: Wav2vec_UConfig):
         super().__init__()
@@ -371,24 +306,19 @@ class Generator(nn.Module):
         padding = (
             cfg.generator_kernel // 2 if cfg.generator_pad < 0 else cfg.generator_pad
         )
-
-        if cfg.generator_dyn_pool:
-            self.boundary_predictor = BoundaryPredictor(cfg)
-            self.proj = nn.Linear(input_dim, output_dim)
-        else: # downsampling by strided convolution: 
-            self.proj = nn.Sequential(
-                TransposeLast(),
-                nn.Conv1d(
-                    input_dim,
-                    output_dim,
-                    kernel_size=cfg.generator_kernel,
-                    stride=cfg.generator_stride,
-                    dilation=cfg.generator_dilation,
-                    padding=padding,
-                    bias=cfg.generator_bias,
-                ),
-                TransposeLast(),
-            )
+        self.proj = nn.Sequential(
+            TransposeLast(),
+            nn.Conv1d(
+                input_dim,
+                output_dim,
+                kernel_size=cfg.generator_kernel,
+                stride=cfg.generator_stride,
+                dilation=cfg.generator_dilation,
+                padding=padding,
+                bias=cfg.generator_bias,
+            ),
+            TransposeLast(),
+        )
 
         if self.batch_norm:
             self.bn = nn.BatchNorm1d(input_dim)
@@ -408,16 +338,8 @@ class Generator(nn.Module):
 
         dense_x = self.dropout(dense_x)
 
-        if self.cfg.generator_dyn_pool:
-            boundary_preds, log_probs = self.boundary_predictor(dense_x)
-            result["log_probs"] = log_probs
-            result["pred_log_probs"] = torch.gather(log_probs, -1, boundary_preds.unsqueeze(2).long())[:, :, 0]
-            dense_x = downsample_by_boundaries(dense_x, boundary_preds)
-            dense_padding_mask = ~dense_x.any(dim=-1)
-        
         dense_x = self.proj(dense_x)
-
-        if not self.cfg.generator_dyn_pool and self.stride > 1:
+        if self.stride > 1:
             dense_padding_mask = dense_padding_mask[:, :: self.stride]
 
         if dense_padding_mask.size(1) != dense_x.size(1):
@@ -452,7 +374,16 @@ class Generator(nn.Module):
         return normed_feature
 
 
-@register_model("testbench", dataclass=Wav2vec_UConfig)
+def pass_grad(x, y):
+    """Manually set gradient for backward pass.
+    for y = f(x), ensure that during the backward pass,
+    dL/dy = dL/dx regardless of f(x).
+    Returns:
+        y, with the gradient forced to be dL/dy = dL/dx.
+    """
+    return y.detach() + (x - x.detach())
+
+@register_model("wav2dyn_conv", dataclass=Wav2vec_UConfig)
 class Wav2vec_U(BaseFairseqModel):
     def calc_gradient_penalty(self, real_data, fake_data):
 
@@ -524,7 +455,6 @@ class Wav2vec_U(BaseFairseqModel):
         self.zero_index = target_dict.index("<SIL>") if "<SIL>" in target_dict else 0
         self.smoothness_weight = cfg.smoothness_weight
 
-        output_size = len(target_dict)
         self.pad = target_dict.pad()
         self.eos = target_dict.eos()
         self.smoothing = cfg.smoothing
@@ -542,16 +472,45 @@ class Wav2vec_U(BaseFairseqModel):
         self.blank_index = target_dict.index("<SIL>") if cfg.blank_is_sil else 0
         assert self.blank_index != target_dict.unk()
 
-        self.discriminator = Discriminator(output_size, cfg)
-        for p in self.discriminator.parameters():
-            p.param_group = "discriminator"
-
         self.pca_A = self.pca_b = None
         d = cfg.input_dim
 
         self.segmenter = SEGMENT_FACTORY[cfg.segmentation.type](cfg.segmentation)
 
-        self.generator = Generator(d, output_size, cfg)
+        # Load LM
+        checkpoint = torch.load(cfg.lm_ckpt) # , map_location=p.device)
+        if os.path.isfile(os.path.join(os.path.dirname(cfg.lm_ckpt), "dict.txt")):
+            print("LM dict provided. Re-ordering LM embeddings to match with data codes")
+            with open(os.path.join(os.path.dirname(cfg.lm_ckpt), "dict.txt"), "r") as f:
+                lm_vocab = [x.split()[0] for x in f]
+            task_vocab = target_dict.symbols[4:] # Omit default fairseq tokens (<s>, <pad>, </s> and <unk>)
+            assert set(lm_vocab) == set(task_vocab), "The task and LM vocabularies don't match"
+            # Sort list2 using list1 as a key
+            sorted_list2 = sorted(lm_vocab, key=lambda x: task_vocab.index(x))
+            # Get the indices that would sort list2 to be the same as list1
+            indices = [lm_vocab.index(x) for x in sorted_list2]
+        state_dict = checkpoint['model']
+        # Discard the embedding and output unit for '\n' which we won't see in the wav2vec-U setup
+        embeddings = state_dict["emb_net.weight"][1:]
+        lm_head_weights = state_dict["lm_head.weight"][1:]
+        # Re-arrange embeddings and output units so that the task codes will match the embeddings codes
+        state_dict["emb_net.weight"] = embeddings[indices]
+        state_dict["lm_head.weight"] = lm_head_weights[indices]
+        self.lm = ConvLM(len(task_vocab))
+        self.lm.eval()
+
+        self.discriminator = Discriminator(len(task_vocab), cfg)
+        # self.discriminator = Discriminator(self.lm.config.n_embd, cfg)
+        # self.discriminator = Discriminator(1, cfg)
+        for p in self.discriminator.parameters():
+            p.param_group = "discriminator"
+
+        self.lm.load_state_dict(state_dict)
+        # Freeze LM
+        for p in self.lm.parameters():
+            p.requires_grad = False
+
+        self.generator = Generator(d, len(task_vocab), cfg)
 
         for p in self.generator.parameters():
             p.param_group = "generator"
@@ -565,14 +524,14 @@ class Wav2vec_U(BaseFairseqModel):
 
         if self.mmi_weight > 0:
             self.target_downsample_rate = cfg.target_downsample_rate
-            self.decoder = nn.Linear(d, cfg.target_dim)
+            if self.generator.residual:
+                self.decoder = nn.Linear(d, cfg.target_dim)
+            else:
+                self.decoder = nn.Linear(len(task_vocab), cfg.target_dim)
             for p in self.decoder.parameters():
                 p.param_group = "generator"
 
-        self.dyn_pool = cfg.generator_dyn_pool
-        if self.dyn_pool:
-            self.pigrad_weight = cfg.pigrad_weight
-            self.len_prior_weight = cfg.len_prior_weight
+        self.log_gradients = cfg.log_gradients
 
     @classmethod
     def build_model(cls, cfg, task):
@@ -661,15 +620,15 @@ class Wav2vec_U(BaseFairseqModel):
     ):
         if segment:
             features, padding_mask = self.segmenter.pre_segment(features, padding_mask)
-
-        orig_size = features.size(0) * features.size(1) - padding_mask.sum()
+        if random_label is not None:
+            random_label[random_label >= 4] -= 4
 
         gen_result = self.generator(features, random_label, padding_mask)
 
         orig_dense_x, token_x = gen_result["dense_x"], gen_result["token_x"]
         orig_dense_padding_mask = gen_result["dense_padding_mask"]
 
-        if segment and not self.dyn_pool:
+        if segment:
             dense_x, dense_padding_mask = self.segmenter.logit_segment(
                 orig_dense_x, orig_dense_padding_mask
             )
@@ -685,6 +644,10 @@ class Wav2vec_U(BaseFairseqModel):
             dense_x, code_perplexity, prob_perplexity = self.normalize(dense_logits)
 
         if dense_x_only or self.discriminator is None:
+            dense_x = torch.concatenate([ # Concat zero probs for default fairseq tokens
+                torch.zeros((dense_x.size(0), dense_x.size(1), 4), device=dense_x.device),
+                dense_x
+            ], dim=-1)
             return {
                 "logits": dense_x,
                 "padding_mask": dense_padding_mask,
@@ -692,8 +655,17 @@ class Wav2vec_U(BaseFairseqModel):
 
         token_padding_mask = random_label == self.pad
 
-        dense_y = self.discriminator(dense_x, dense_padding_mask)
-        token_y = self.discriminator(token_x, token_padding_mask)
+        # one_hot_x = F.one_hot(dense_x.argmax(dim=-1), num_classes=self.lm.config.vocab_size).float()
+        # one_hot_x = one_hot_x - dense_x.detach() + dense_x # Straight through estimator
+        
+        entropy_gen = self.lm(dense_x)
+        entropy_true = self.lm(token_x)
+
+        dense_y = self.discriminator(entropy_gen, dense_padding_mask)
+        token_y = self.discriminator(entropy_true, token_padding_mask)
+
+        acc_dense = (F.sigmoid(dense_y).round() == 1).float().mean()
+        acc_token = (F.sigmoid(token_y).round() == 0).float().mean()
 
         sample_size = features.size(0)
 
@@ -704,13 +676,17 @@ class Wav2vec_U(BaseFairseqModel):
         if self.smoothing_one_sided:
             fake_smooth = 0
 
-        zero_loss = None
         smoothness_loss = None
         code_pen = None
         mmi_loss = None
-        pigrad_loss = None
-        len_prior_loss = None
 
+        if self.log_gradients:
+            # grad_token_lm = None
+            grad_dense_lm = None
+            grad_dense_g = None
+            grad_mmi_g = None
+            grad_smoothness_g = None
+            grad_code_pen_g = None
         if d_step:
             loss_dense = F.binary_cross_entropy_with_logits(
                 dense_y,
@@ -723,23 +699,60 @@ class Wav2vec_U(BaseFairseqModel):
                 reduction="sum",
             )
             if self.training and self.gradient_penalty > 0:
-                grad_pen = self.calc_gradient_penalty(token_x, dense_x)
+                grad_pen = self.calc_gradient_penalty(entropy_true, entropy_gen)
                 grad_pen = grad_pen.sum() * self.gradient_penalty
             else:
                 grad_pen = None
+            if self.log_gradients:
+                grad_dense_lm = torch.norm(autograd.grad(
+                    outputs=loss_dense,
+                    inputs=entropy_gen,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0])
+                grad_dense_g = torch.norm(autograd.grad(
+                    outputs=loss_dense,
+                    inputs=dense_x,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0])
         else:
             grad_pen = None
             loss_token = None
-            loss_dense_per_sample = F.binary_cross_entropy_with_logits(
+            loss_dense = F.binary_cross_entropy_with_logits(
                 dense_y,
                 dense_y.new_zeros(dense_y.shape) + fake_smooth,
-                reduction="none",
+                reduction="sum",
             )
-            loss_dense = loss_dense_per_sample.mean()
+            if self.log_gradients:
+                grad_dense_lm = torch.norm(autograd.grad(
+                    outputs=loss_dense,
+                    inputs=entropy_gen,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0])
+                grad_dense_g = torch.norm(autograd.grad(
+                    outputs=loss_dense,
+                    inputs=dense_x,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0])
             num_vars = dense_x.size(-1)
             if prob_perplexity is not None:
                 code_pen = (num_vars - prob_perplexity) / num_vars
                 code_pen = code_pen * sample_size * self.code_penalty
+                if self.log_gradients:
+                    grad_code_pen_g = torch.norm(autograd.grad(
+                        outputs=code_pen,
+                        inputs=dense_logits,
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0])
 
             if self.smoothness_weight > 0:
                 smoothness_loss = F.mse_loss(
@@ -749,9 +762,19 @@ class Wav2vec_U(BaseFairseqModel):
                 smoothness_loss = (
                     smoothness_loss.mean() * sample_size * self.smoothness_weight
                 )
-
+                if self.log_gradients:
+                    grad_smoothness_g = torch.norm(autograd.grad(
+                        outputs=smoothness_loss,
+                        inputs=dense_logits,
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0])
             if (self.mmi_weight > 0) and (aux_target is not None):
-                inter_x = self.decoder(gen_result["inter_x"])
+                if self.generator.residual:
+                    inter_x = self.decoder(gen_result["inter_x"])
+                else:
+                    inter_x = self.decoder(orig_dense_x)
                 if self.target_downsample_rate > 1:
                     aux_target = aux_target[:, :: self.target_downsample_rate]
                 max_t_len = min(aux_target.shape[1], inter_x.shape[1])
@@ -762,37 +785,39 @@ class Wav2vec_U(BaseFairseqModel):
                     reduction="none",
                 )
                 mmi_loss = mmi_loss.mean() * mmi_loss.shape[0] * self.mmi_weight
-
-            if self.pigrad_weight > 0:
-                reward = loss_dense_per_sample
-                pigrad_loss = (gen_result["pred_log_probs"].sum(-1) * reward).mean()
-
-            if self.len_prior_weight > 0:
-                sample_len = 8
-                num_samples = 128        
-                all_segments_len_sample_probs = F.unfold(gen_result["log_probs"].view(-1, 2)[:, 1].exp().view(1, 1, -1, 1), (sample_len, 1))
-                selected = torch.randint(0, all_segments_len_sample_probs.size(-1), size=(num_samples,), )     
-                expected_num_boundaries = all_segments_len_sample_probs[..., selected].sum(1)
-                len_prior_loss = (expected_num_boundaries.mean() - (sample_len / AVG_PHONE_DURATION))**2
+                if self.log_gradients:
+                    grad_mmi_g = torch.norm(autograd.grad(
+                        outputs=mmi_loss,
+                        inputs=inter_x,
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0])
 
         result = {
             "losses": {
                 "grad_pen": grad_pen,
                 "code_pen": code_pen,
                 "smoothness": smoothness_loss,
-                "mmi": mmi_loss,
-                "pigrad": pigrad_loss,
-                "len_prior": len_prior_loss
+                "mmi": mmi_loss,    
             },
             "temp": self.curr_temp,
             "code_ppl": code_perplexity,
             "prob_ppl": prob_perplexity,
             "d_steps": int(d_step),
             "sample_size": sample_size,
+            "acc_dense": acc_dense,
+            "acc_token": acc_token
         }
 
         suff = "_d" if d_step else "_g"
         result["losses"]["dense" + suff] = loss_dense
         result["losses"]["token" + suff] = loss_token
 
+        if self.log_gradients:
+            result["grad_dense_lm"] = grad_dense_lm
+            result["grad_dense_g"] = grad_dense_g
+            result["grad_mmi_g"] = grad_mmi_g
+            result["grad_smoothness_g"] = grad_smoothness_g
+            result["grad_code_pen_g"] = grad_code_pen_g
         return result

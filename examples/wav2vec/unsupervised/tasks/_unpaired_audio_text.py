@@ -49,6 +49,9 @@ class UnpairedAudioTextConfig(FairseqDataclass):
     text_data: str = field(
         default=MISSING, metadata={"help": "path to data directory containing text"}
     )
+    # lm_dict: Optional[str] = field(
+        # default=None, metadata={"help": "path to data directory containing an LM dict for token encoding"}
+    # )
     max_length: Optional[int] = None
     labels: Optional[str] = field(
         default=None,
@@ -154,7 +157,13 @@ class UnpairedAudioText(FairseqTask):
         Args:
             cfg (AudioPretrainingConfig): configuration of this task
         """
-
+        # import ptvsd
+        # ptvsd.enable_attach(('0.0.0.0', 7310))
+        # print("Attach debugger now")
+        # ptvsd.wait_for_attach()
+        # if cfg.lm_dict is not None: 
+            # dict_path = cfg.lm_dict
+        # else:
         dict_path = os.path.join(cfg.text_data, "dict.txt")
         if os.path.exists(dict_path):
             target_dictionary = Dictionary.load(dict_path)

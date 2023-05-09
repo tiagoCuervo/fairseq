@@ -13,6 +13,9 @@ import math
 import os
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import random
+
+import wandb
 
 # We need to setup root logger before importing any fairseq libraries.
 logging.basicConfig(
@@ -43,6 +46,11 @@ from fairseq.trainer import Trainer
 
 
 def main(cfg: FairseqConfig) -> None:
+    # import ptvsd
+    # ptvsd.enable_attach(('0.0.0.0', 7310))
+    # print("Attach debugger now")
+    # ptvsd.wait_for_attach()
+    
     if isinstance(cfg, argparse.Namespace):
         cfg = convert_namespace_to_omegaconf(cfg)
 
@@ -65,7 +73,12 @@ def main(cfg: FairseqConfig) -> None:
         handler = logging.FileHandler(filename=cfg.common.log_file)
         logger.addHandler(handler)
 
+    # torch.use_deterministic_algorithms(True)
+    random.seed(cfg.common.seed)
     np.random.seed(cfg.common.seed)
+    # if torch.backends.cudnn.enabled:
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     utils.set_torch_seed(cfg.common.seed)
 
     if distributed_utils.is_master(cfg.distributed_training):
@@ -294,6 +307,11 @@ def train(
             if distributed_utils.is_master(cfg.distributed_training)
             else None
         ),
+        wandb_entity=(
+            cfg.common.wandb_entity
+            if distributed_utils.is_master(cfg.distributed_training)
+            else None
+        ),
         wandb_run_name=os.environ.get(
             "WANDB_NAME", os.path.basename(cfg.checkpoint.save_dir)
         ),
@@ -304,6 +322,14 @@ def train(
         ),
     )
     progress.update_config(_flatten_config(cfg))
+
+    if epoch_itr.next_epoch_idx == 1:
+        wandb.watch(
+            trainer.model,
+            log="gradients",
+            log_freq=cfg.common.log_interval,
+            idx=0
+        )
 
     trainer.begin_epoch(epoch_itr.epoch)
 

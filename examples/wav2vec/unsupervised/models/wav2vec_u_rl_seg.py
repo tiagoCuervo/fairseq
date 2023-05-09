@@ -22,6 +22,8 @@ from fairseq.modules import (
     TransposeLast,
 )
 
+from fairseq.models.wav2vec import TransformerEncoder, ConformerEncoder
+
 
 class SegmentationType(Enum):
     NONE = auto()
@@ -42,8 +44,6 @@ class SegmentationConfig(FairseqDataclass):
 
 @dataclass
 class Wav2vec_UConfig(FairseqDataclass):
-    log_gradients: bool = False 
-
     discriminator_kernel: int = 3
     discriminator_dilation: int = 1
     discriminator_dim: int = 256
@@ -64,6 +64,27 @@ class Wav2vec_UConfig(FairseqDataclass):
     generator_dropout: float = 0.0
     generator_batch_norm: int = 0
     generator_residual: bool = False
+    generator_dyn_pool: bool = False
+    # Boundary predictor config 
+    lstm_dim: int = 256
+    encoder_embed_dim: int = 1024
+    encoder_ffn_embed_dim: int = 2048
+    encoder_attention_heads: int = 8
+    dropout: float = 0.1
+    attention_dropout: float = 0.1
+    activation_dropout: float = 0.1
+    activation_fn: str = "relu"
+    layer_norm_first: bool = False
+    layer_type: str = "transformer"
+    attn_type: str = ""
+    pos_enc_type: str = "abs"
+    encoder_layers: int = 1
+    required_seq_len_multiple: int = 2
+    conv_pos: int = 128
+    conv_pos_groups: int = 16
+    pos_conv_depth: int = 1
+    encoder_layerdrop: float = 0.0
+    checkpoint_activations: bool = False
 
     blank_weight: float = 0
     blank_mode: str = "add"
@@ -83,6 +104,8 @@ class Wav2vec_UConfig(FairseqDataclass):
     hard_gumbel: bool = True
     temp: Tuple[float, float, float] = (2, 0.1, 0.99995)
     input_dim: int = 128
+    pigrad_weight: float = 1.0
+    len_prior_weight: float = 0.0
 
     segmentation: SegmentationConfig = SegmentationConfig()
 
@@ -207,7 +230,7 @@ SEGMENT_FACTORY = {
     SegmentationType.RANDOM: RandomSegmenter,
     SegmentationType.UNIFORM_RANDOM: UniformRandomSegmenter,
     SegmentationType.UNIFORM_RANDOM_JOIN: UniformRandomJoinSegmenter,
-    SegmentationType.JOIN: JoinSegmenter,
+    SegmentationType.JOIN: JoinSegmenter
 }
 
 
@@ -287,6 +310,58 @@ class Discriminator(nn.Module):
         return x
 
 
+AVG_PHONE_DURATION = 3.790364
+
+
+class BoundaryPredictor(nn.Module):
+    def __init__(self, cfg: Wav2vec_UConfig):
+        super().__init__()
+        self.layer_type = cfg.layer_type
+        if cfg.layer_type == "lstm":
+            self.proj = nn.LSTM(cfg.encoder_embed_dim, cfg.lstm_dim, cfg.encoder_layers, batch_first=True)
+        else:
+            encoder = TransformerEncoder    
+            if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
+                encoder = ConformerEncoder
+            self.proj = encoder(cfg)
+        self.predictor = nn.Linear(cfg.encoder_embed_dim, 2)
+
+    def forward(self, x):
+        bs, l, _ = x.size()
+        x, _ = self.proj(x)
+        x = self.predictor(x)
+        boundary_log_probs = torch.log_softmax(x, dim=-1)
+        if self.training:
+            boundaries = torch.multinomial(torch.exp(boundary_log_probs).view(bs * l, -1), 1).view(bs, l).float()
+        else:
+            boundaries = torch.argmax(boundary_log_probs, dim=-1)
+        return boundaries, boundary_log_probs
+ 
+
+def downsample_by_boundaries(x, boundary_indicators):
+    boundaries =  torch.nonzero(boundary_indicators.view(-1), as_tuple=True)[0]
+    orig_length = x.size(1)
+    # Ensure that minibatch boundaries are preserved
+    seqEndIdx = torch.arange(0, x.size(0)*x.size(1) + 1, x.size(1), device=x.device)
+    boundaries = torch.unique(torch.cat((boundaries, seqEndIdx)), sorted=True)
+    # Compute compression matrices
+    cutpoints = torch.nonzero((boundaries % orig_length) == 0)
+    seqIdx = torch.nn.utils.rnn.pad_sequence(
+        torch.split(boundaries[1:] % orig_length, tuple(cutpoints[1:]-cutpoints[:-1])), batch_first=True)
+    seqIdx[seqIdx==0] = orig_length
+    seqIdx = F.pad(seqIdx, (1,0,0,0)).to(device=x.device)
+    frame_idxs = torch.arange(orig_length, device=x.device).view(1, 1, -1)
+    compress_matrices = (
+        (seqIdx[:,:-1, None] <= frame_idxs)
+        & (seqIdx[:,1:, None] > frame_idxs)
+    ).float()
+    # Average pool
+    assert compress_matrices.shape[0] == x.shape[0]
+    denom = torch.maximum(compress_matrices.sum(-1, keepdim=True), torch.ones(1, device=compress_matrices.device))
+    avg_pooled_x = torch.bmm(compress_matrices / denom, x)
+    return avg_pooled_x
+
+
 class Generator(nn.Module):
     def __init__(self, input_dim, output_dim, cfg: Wav2vec_UConfig):
         super().__init__()
@@ -301,19 +376,30 @@ class Generator(nn.Module):
         padding = (
             cfg.generator_kernel // 2 if cfg.generator_pad < 0 else cfg.generator_pad
         )
-        self.proj = nn.Sequential(
-            TransposeLast(),
-            nn.Conv1d(
-                input_dim,
-                output_dim,
-                kernel_size=cfg.generator_kernel,
-                stride=cfg.generator_stride,
-                dilation=cfg.generator_dilation,
-                padding=padding,
-                bias=cfg.generator_bias,
-            ),
-            TransposeLast(),
-        )
+
+        if cfg.generator_dyn_pool:
+            self.boundary_predictor = BoundaryPredictor(cfg)
+            self.proj = nn.Linear(input_dim, output_dim)
+        else: # downsampling by strided convolution: 
+            self.proj = nn.Sequential(
+                TransposeLast(),
+                # nn.Conv1d(
+                #     input_dim,
+                #     output_dim,
+                #     kernel_size=cfg.generator_kernel,
+                #     stride=cfg.generator_stride,
+                #     dilation=cfg.generator_dilation,
+                #     padding=padding,
+                #     bias=cfg.generator_bias,
+                # ),
+                nn.AvgPool1d(
+                    kernel_size=cfg.generator_kernel,
+                    stride=cfg.generator_stride,
+                    padding=padding,
+                ),
+                TransposeLast(),
+                nn.Linear(input_dim, output_dim),
+            )
 
         if self.batch_norm:
             self.bn = nn.BatchNorm1d(input_dim)
@@ -333,8 +419,16 @@ class Generator(nn.Module):
 
         dense_x = self.dropout(dense_x)
 
+        if self.cfg.generator_dyn_pool:
+            boundary_preds, log_probs = self.boundary_predictor(dense_x)
+            result["log_probs"] = log_probs
+            result["pred_log_probs"] = torch.gather(log_probs, -1, boundary_preds.unsqueeze(2).long())[:, :, 0]
+            dense_x = downsample_by_boundaries(dense_x, boundary_preds)
+            dense_padding_mask = ~dense_x.any(dim=-1)
+        
         dense_x = self.proj(dense_x)
-        if self.stride > 1:
+
+        if not self.cfg.generator_dyn_pool and self.stride > 1:
             dense_padding_mask = dense_padding_mask[:, :: self.stride]
 
         if dense_padding_mask.size(1) != dense_x.size(1):
@@ -369,7 +463,7 @@ class Generator(nn.Module):
         return normed_feature
 
 
-@register_model("wav2vec_u", dataclass=Wav2vec_UConfig)
+@register_model("wav2vec_u_rl_seg", dataclass=Wav2vec_UConfig)
 class Wav2vec_U(BaseFairseqModel):
     def calc_gradient_penalty(self, real_data, fake_data):
 
@@ -432,6 +526,10 @@ class Wav2vec_U(BaseFairseqModel):
 
     def __init__(self, cfg: Wav2vec_UConfig, target_dict):
         super().__init__()
+        # import ptvsd
+        # ptvsd.enable_attach(('0.0.0.0', 7310))
+        # print("Attach debugger now")
+        # ptvsd.wait_for_attach()
 
         self.cfg = cfg
         self.zero_index = target_dict.index("<SIL>") if "<SIL>" in target_dict else 0
@@ -481,8 +579,13 @@ class Wav2vec_U(BaseFairseqModel):
             self.decoder = nn.Linear(d, cfg.target_dim)
             for p in self.decoder.parameters():
                 p.param_group = "generator"
+        self.pigrad_weight = 0
+        self.len_prior_weight = 0
 
-        self.log_gradients = cfg.log_gradients
+        self.dyn_pool = cfg.generator_dyn_pool
+        if self.dyn_pool:
+            self.pigrad_weight = cfg.pigrad_weight
+            self.len_prior_weight = cfg.len_prior_weight
 
     @classmethod
     def build_model(cls, cfg, task):
@@ -579,7 +682,7 @@ class Wav2vec_U(BaseFairseqModel):
         orig_dense_x, token_x = gen_result["dense_x"], gen_result["token_x"]
         orig_dense_padding_mask = gen_result["dense_padding_mask"]
 
-        if segment:
+        if segment and not self.dyn_pool:
             dense_x, dense_padding_mask = self.segmenter.logit_segment(
                 orig_dense_x, orig_dense_padding_mask
             )
@@ -605,9 +708,6 @@ class Wav2vec_U(BaseFairseqModel):
         dense_y = self.discriminator(dense_x, dense_padding_mask)
         token_y = self.discriminator(token_x, token_padding_mask)
 
-        acc_dense = (F.sigmoid(dense_y).round() == 1).float().mean()
-        acc_token = (F.sigmoid(token_y).round() == 0).float().mean()
-
         sample_size = features.size(0)
 
         d_step = self.discrim_step(self.update_num)
@@ -621,12 +721,9 @@ class Wav2vec_U(BaseFairseqModel):
         smoothness_loss = None
         code_pen = None
         mmi_loss = None
+        pigrad_loss = None
+        len_prior_loss = None
 
-        if self.log_gradients:
-            grad_dense_g = None
-            grad_mmi_g = None
-            grad_smoothness_g = None
-            grad_code_pen_g = None
         if d_step:
             loss_dense = F.binary_cross_entropy_with_logits(
                 dense_y,
@@ -643,42 +740,19 @@ class Wav2vec_U(BaseFairseqModel):
                 grad_pen = grad_pen.sum() * self.gradient_penalty
             else:
                 grad_pen = None
-            if self.log_gradients:
-                grad_dense_g = torch.norm(autograd.grad(
-                    outputs=loss_dense,
-                    inputs=dense_x,
-                    create_graph=True,
-                    retain_graph=True,
-                    only_inputs=True
-                )[0])
         else:
             grad_pen = None
             loss_token = None
-            loss_dense = F.binary_cross_entropy_with_logits(
+            loss_dense_per_sample = F.binary_cross_entropy_with_logits(
                 dense_y,
                 dense_y.new_zeros(dense_y.shape) + fake_smooth,
-                reduction="sum",
+                reduction="none",
             )
-            if self.log_gradients:
-                grad_dense_g = torch.norm(autograd.grad(
-                    outputs=loss_dense,
-                    inputs=dense_x,
-                    create_graph=True,
-                    retain_graph=True,
-                    only_inputs=True
-                )[0])
+            loss_dense = loss_dense_per_sample.mean()
             num_vars = dense_x.size(-1)
             if prob_perplexity is not None:
                 code_pen = (num_vars - prob_perplexity) / num_vars
                 code_pen = code_pen * sample_size * self.code_penalty
-                if self.log_gradients:
-                    grad_code_pen_g = torch.norm(autograd.grad(
-                        outputs=code_pen,
-                        inputs=dense_logits,
-                        create_graph=True,
-                        retain_graph=True,
-                        only_inputs=True
-                    )[0])
 
             if self.smoothness_weight > 0:
                 smoothness_loss = F.mse_loss(
@@ -688,14 +762,6 @@ class Wav2vec_U(BaseFairseqModel):
                 smoothness_loss = (
                     smoothness_loss.mean() * sample_size * self.smoothness_weight
                 )
-                if self.log_gradients:
-                    grad_smoothness_g = torch.norm(autograd.grad(
-                        outputs=smoothness_loss,
-                        inputs=dense_logits,
-                        create_graph=True,
-                        retain_graph=True,
-                        only_inputs=True
-                    )[0])
 
             if (self.mmi_weight > 0) and (aux_target is not None):
                 inter_x = self.decoder(gen_result["inter_x"])
@@ -709,14 +775,18 @@ class Wav2vec_U(BaseFairseqModel):
                     reduction="none",
                 )
                 mmi_loss = mmi_loss.mean() * mmi_loss.shape[0] * self.mmi_weight
-                if self.log_gradients:
-                    grad_mmi_g = torch.norm(autograd.grad(
-                        outputs=mmi_loss,
-                        inputs=inter_x,
-                        create_graph=True,
-                        retain_graph=True,
-                        only_inputs=True
-                    )[0])
+
+            if self.pigrad_weight > 0:
+                reward = loss_dense_per_sample
+                pigrad_loss = (gen_result["pred_log_probs"].sum(-1) * reward).mean()
+
+            if self.len_prior_weight > 0:
+                sample_len = 8
+                num_samples = 128        
+                all_segments_len_sample_probs = F.unfold(gen_result["log_probs"].view(-1, 2)[:, 1].exp().view(1, 1, -1, 1), (sample_len, 1))
+                selected = torch.randint(0, all_segments_len_sample_probs.size(-1), size=(num_samples,), )     
+                expected_num_boundaries = all_segments_len_sample_probs[..., selected].sum(1)
+                len_prior_loss = (expected_num_boundaries.mean() - (sample_len / AVG_PHONE_DURATION))**2
 
         result = {
             "losses": {
@@ -724,23 +794,18 @@ class Wav2vec_U(BaseFairseqModel):
                 "code_pen": code_pen,
                 "smoothness": smoothness_loss,
                 "mmi": mmi_loss,
+                "pigrad": pigrad_loss,
+                "len_prior": len_prior_loss
             },
             "temp": self.curr_temp,
             "code_ppl": code_perplexity,
             "prob_ppl": prob_perplexity,
             "d_steps": int(d_step),
             "sample_size": sample_size,
-            "acc_dense": acc_dense,
-            "acc_token": acc_token
         }
 
         suff = "_d" if d_step else "_g"
         result["losses"]["dense" + suff] = loss_dense
         result["losses"]["token" + suff] = loss_token
 
-        if self.log_gradients:
-            result["grad_dense_g"] = grad_dense_g
-            result["grad_mmi_g"] = grad_mmi_g
-            result["grad_smoothness_g"] = grad_smoothness_g
-            result["grad_code_pen_g"] = grad_code_pen_g
         return result
