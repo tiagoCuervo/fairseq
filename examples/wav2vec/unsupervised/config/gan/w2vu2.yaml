@@ -46,8 +46,8 @@ criterion:
   log_keys:
     - temp
     - code_ppl
-    - acc_dense
-    - acc_token
+    - score_dense
+    - score_token
     - grad_dense_g
     - grad_mmi_g
     - grad_smoothness_g

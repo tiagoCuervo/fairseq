@@ -605,8 +605,8 @@ class Wav2vec_U(BaseFairseqModel):
         dense_y = self.discriminator(dense_x, dense_padding_mask)
         token_y = self.discriminator(token_x, token_padding_mask)
 
-        acc_dense = (F.sigmoid(dense_y).round() == 1).float().mean()
-        acc_token = (F.sigmoid(token_y).round() == 0).float().mean()
+        score_dense = F.sigmoid(dense_y).mean()
+        score_token = F.sigmoid(token_y).mean()
 
         sample_size = features.size(0)
 
@@ -730,8 +730,8 @@ class Wav2vec_U(BaseFairseqModel):
             "prob_ppl": prob_perplexity,
             "d_steps": int(d_step),
             "sample_size": sample_size,
-            "acc_dense": acc_dense,
-            "acc_token": acc_token
+            "score_dense": score_dense,
+            "score_token": score_token
         }
 
         suff = "_d" if d_step else "_g"

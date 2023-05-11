@@ -46,8 +46,8 @@ criterion:
   log_keys:
     - temp
     - code_ppl
-    - acc_dense
-    - acc_token
+    - score_dense
+    - score_token
     - grad_token_lm
     - grad_dense_lm
     - grad_dense_g
@@ -74,7 +74,7 @@ optimizer:
         amsgrad: false
       lr_scheduler:
         _name: fixed
-        warmup_updates: 5000
+        warmup_updates: 2000
     discriminator:
       lr: [ 0.0003 ]
       lr_float: null
@@ -86,7 +86,7 @@ optimizer:
         amsgrad: false
       lr_scheduler:
         _name: fixed
-        warmup_updates: 5000
+        warmup_updates: 0
 
 lr_scheduler: pass_through
 
@@ -103,6 +103,7 @@ model:
   discriminator_act_after_linear: false
   discriminator_dropout: 0.0
   discriminator_weight_norm: false
+  discriminator_spectral_norm: false
 
   generator_stride: 3
   generator_kernel: 9

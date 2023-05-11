@@ -46,8 +46,8 @@ criterion:
   log_keys:
     - temp
     - code_ppl
-    - acc_dense
-    - acc_token
+    - score_dense
+    - score_token
     - grad_token_lm
     - grad_dense_lm
     - grad_dense_g
@@ -102,6 +102,7 @@ model:
   discriminator_act_after_linear: false
   discriminator_dropout: 0.0
   discriminator_weight_norm: false
+  discriminator_spectral_norm: false
 
   generator_stride: 3
   generator_kernel: 9

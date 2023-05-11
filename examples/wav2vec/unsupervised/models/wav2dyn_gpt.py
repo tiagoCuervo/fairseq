@@ -265,7 +265,7 @@ class SelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # Disable Memory-Efficient Attention kernel because getting backprop error with it, possibly due to gradient penalty loss
         with torch.backends.cuda.sdp_kernel(enable_mem_efficient=False):
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=False)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -442,7 +442,6 @@ class Generator(nn.Module):
         if self.batch_norm:
             self.bn = nn.BatchNorm1d(input_dim)
             self.bn.weight.data.fill_(cfg.generator_batch_norm)
-            # self.bn.bias.requires_grad_(False)
         if self.residual:
             self.in_proj = nn.Linear(input_dim, input_dim)
 
@@ -493,15 +492,6 @@ class Generator(nn.Module):
         ).squeeze(-1)
         return normed_feature
 
-
-def pass_grad(x, y):
-    """Manually set gradient for backward pass.
-    for y = f(x), ensure that during the backward pass,
-    dL/dy = dL/dx regardless of f(x).
-    Returns:
-        y, with the gradient forced to be dL/dy = dL/dx.
-    """
-    return y.detach() + (x - x.detach())
 
 @register_model("wav2dyn_gpt", dataclass=Wav2vec_UConfig)
 class Wav2vec_U(BaseFairseqModel):
@@ -575,6 +565,7 @@ class Wav2vec_U(BaseFairseqModel):
         self.zero_index = target_dict.index("<SIL>") if "<SIL>" in target_dict else 0
         self.smoothness_weight = cfg.smoothness_weight
 
+        output_size = len(target_dict)
         self.pad = target_dict.pad()
         self.eos = target_dict.eos()
         self.smoothing = cfg.smoothing
@@ -603,38 +594,23 @@ class Wav2vec_U(BaseFairseqModel):
             print("LM dict provided. Re-ordering LM embeddings to match with data codes")
             with open(os.path.join(os.path.dirname(cfg.lm_ckpt), "dict.txt"), "r") as f:
                 lm_vocab = [x.split()[0] for x in f]
-            task_vocab = target_dict.symbols[4:] # Omit default fairseq tokens (<s>, <pad>, </s> and <unk>)
-            assert set(lm_vocab) == set(task_vocab), "The task and LM vocabularies don't match"
+            assert set(lm_vocab) == set(target_dict.symbols), "The task and LM vocabularies don't match"
             # Sort list2 using list1 as a key
-            sorted_list2 = sorted(lm_vocab, key=lambda x: task_vocab.index(x))
+            sorted_list2 = sorted(lm_vocab, key=lambda x: target_dict.symbols.index(x))
             # Get the indices that would sort list2 to be the same as list1
             indices = [lm_vocab.index(x) for x in sorted_list2]
         gptconf = GPTConfig(**checkpoint['model_args'])
         self.block_size = gptconf.block_size
-        # gptconf.vocab_size += 3 # for 4 default fairseq tokens minus \n to discard
-        # self.lm = GPT(gptconf)
-        # state_dict = checkpoint['model']
-        # # Discard the embedding and output unit for '\n' which we won't see in the wav2vec-U setup
-        # embeddings = state_dict["transformer.wte.weight"][1:]
-        # lm_head_weights = state_dict["lm_head.weight"][1:]
-        # # Re-arrange embeddings and output units so that the task codes will match the embeddings codes
-        # state_dict["transformer.wte.weight"] = torch.concatenate((
-        #     torch.randn((4, gptconf.n_embd)), # Random embeddings for default fairseq tokens
-        #     embeddings[indices]
-        # ))
-        # state_dict["lm_head.weight"] = lm_head_weights[indices]
-        # # We skip as outputs the default tokens and '\n'
-        # self.lm.lm_head = nn.Linear(gptconf.n_embd, gptconf.vocab_size - 4, bias=False)
-        gptconf.vocab_size -= 1 # Discarding \n
         state_dict = checkpoint['model']
-        # Discard the embedding and output unit for '\n' which we won't see in the wav2vec-U setup
-        embeddings = state_dict["transformer.wte.weight"][1:]
-        lm_head_weights = state_dict["lm_head.weight"][1:]
         # Re-arrange embeddings and output units so that the task codes will match the embeddings codes
-        state_dict["transformer.wte.weight"] = embeddings[indices]
-        state_dict["lm_head.weight"] = lm_head_weights[indices]
+        state_dict["transformer.wte.weight"] = state_dict["transformer.wte.weight"][indices]
+        state_dict["lm_head.weight"] = state_dict["lm_head.weight"][indices]
         self.lm = GPT(gptconf)
+        self.lm.load_state_dict(state_dict)
         self.lm.eval()
+        # Freeze LM
+        for p in self.lm.parameters():
+            p.requires_grad = False
 
         if cfg.discriminator_type == "conv":
             discriminator_model = ConvDiscriminator
@@ -642,31 +618,19 @@ class Wav2vec_U(BaseFairseqModel):
             discriminator_model = TransformerDiscriminator
         else:
             raise NotImplementedError
-        self.discriminator = discriminator_model(gptconf.vocab_size, cfg)
+        self.discriminator = discriminator_model(output_size, cfg)
         # self.discriminator = discriminator_model(self.lm.config.n_embd, cfg)
         # self.discriminator = discriminator_model(1, cfg)
         for p in self.discriminator.parameters():
             p.param_group = "discriminator"
 
-        unwanted_prefix = '_orig_mod.'
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        self.lm.load_state_dict(state_dict)
-        # Freeze LM
-        for p in self.lm.parameters():
-            p.requires_grad = False
-
-        self.generator = Generator(d, gptconf.vocab_size, cfg)
+        self.generator = Generator(d, output_size, cfg)
 
         for p in self.generator.parameters():
             p.param_group = "generator"
 
         for p in self.segmenter.parameters():
             p.param_group = "generator"
-
-        # for p in self.lm.parameters():
-            # p.param_group = "lm"
 
         self.max_temp, self.min_temp, self.temp_decay = cfg.temp
         self.curr_temp = self.max_temp
@@ -677,7 +641,7 @@ class Wav2vec_U(BaseFairseqModel):
             if self.generator.residual:
                 self.decoder = nn.Linear(d, cfg.target_dim)
             else:
-                self.decoder = nn.Linear(gptconf.vocab_size, cfg.target_dim)
+                self.decoder = nn.Linear(output_size, cfg.target_dim)
             for p in self.decoder.parameters():
                 p.param_group = "generator"
 
@@ -770,10 +734,6 @@ class Wav2vec_U(BaseFairseqModel):
     ):
         if segment:
             features, padding_mask = self.segmenter.pre_segment(features, padding_mask)
-        if random_label is not None:
-            random_label[random_label >= 4] -= 4
-
-        orig_size = features.size(0) * features.size(1) - padding_mask.sum()
 
         gen_result = self.generator(features, random_label, padding_mask)
 
@@ -796,10 +756,6 @@ class Wav2vec_U(BaseFairseqModel):
             dense_x, code_perplexity, prob_perplexity = self.normalize(dense_logits)
 
         if dense_x_only or self.discriminator is None:
-            dense_x = torch.concatenate([ # Concat zero probs for default fairseq tokens
-                torch.zeros((dense_x.size(0), dense_x.size(1), 4), device=dense_x.device),
-                dense_x
-            ], dim=-1)
             return {
                 "logits": dense_x,
                 "padding_mask": dense_padding_mask,
@@ -816,8 +772,8 @@ class Wav2vec_U(BaseFairseqModel):
         dense_y = self.discriminator(entropy_gen, dense_padding_mask[:, :self.block_size])
         token_y = self.discriminator(entropy_true, token_padding_mask[:, :self.block_size])
 
-        acc_dense = (F.sigmoid(dense_y).round() == 1).float().mean()
-        acc_token = (F.sigmoid(token_y).round() == 0).float().mean()
+        score_dense = F.sigmoid(dense_y).mean()
+        score_token = F.sigmoid(token_y).mean()
 
         sample_size = features.size(0)
 
@@ -833,7 +789,6 @@ class Wav2vec_U(BaseFairseqModel):
         mmi_loss = None
 
         if self.log_gradients:
-            # grad_token_lm = None
             grad_dense_lm = None
             grad_dense_g = None
             grad_mmi_g = None
@@ -870,13 +825,6 @@ class Wav2vec_U(BaseFairseqModel):
                     retain_graph=True,
                     only_inputs=True
                 )[0])
-                # grad_token_lm = torch.norm(autograd.grad(
-                #     outputs=loss_token,
-                #     inputs=entropy_true,
-                #     create_graph=True,
-                #     retain_graph=True,
-                #     only_inputs=True
-                # )[0])
         else:
             grad_pen = None
             loss_token = None
@@ -917,7 +865,11 @@ class Wav2vec_U(BaseFairseqModel):
                 smoothness_loss = F.mse_loss(
                     dense_logits[:, :-1], dense_logits[:, 1:], reduction="none"
                 )
+                # smoothness_loss = F.mse_loss(
+                #     orig_dense_x[:, :-1], orig_dense_x[:, 1:], reduction="none"
+                # )
                 smoothness_loss[dense_padding_mask[:, 1:]] = 0
+                # smoothness_loss[orig_dense_padding_mask[:, 1:]] = 0
                 smoothness_loss = (
                     smoothness_loss.mean() * sample_size * self.smoothness_weight
                 )
@@ -925,6 +877,7 @@ class Wav2vec_U(BaseFairseqModel):
                     grad_smoothness_g = torch.norm(autograd.grad(
                         outputs=smoothness_loss,
                         inputs=dense_logits,
+                        # inputs=orig_dense_x,
                         create_graph=True,
                         retain_graph=True,
                         only_inputs=True
@@ -965,8 +918,8 @@ class Wav2vec_U(BaseFairseqModel):
             "prob_ppl": prob_perplexity,
             "d_steps": int(d_step),
             "sample_size": sample_size,
-            "acc_dense": acc_dense,
-            "acc_token": acc_token
+            "score_dense": score_dense,
+            "score_token": score_token
         }
 
         suff = "_d" if d_step else "_g"
@@ -974,8 +927,6 @@ class Wav2vec_U(BaseFairseqModel):
         result["losses"]["token" + suff] = loss_token
 
         if self.log_gradients:
-            # if grad_token_lm is not None:
-            #     result["grad_token_lm"] = torch.norm(grad_token_lm)
             result["grad_dense_lm"] = grad_dense_lm
             result["grad_dense_g"] = grad_dense_g
             result["grad_mmi_g"] = grad_mmi_g

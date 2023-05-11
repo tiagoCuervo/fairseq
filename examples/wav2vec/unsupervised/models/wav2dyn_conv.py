@@ -499,6 +499,8 @@ class Wav2vec_U(BaseFairseqModel):
         self.lm = ConvLM(len(task_vocab))
         self.lm.eval()
 
+        self.vocab_size = len(task_vocab)
+
         self.discriminator = Discriminator(len(task_vocab), cfg)
         # self.discriminator = Discriminator(self.lm.config.n_embd, cfg)
         # self.discriminator = Discriminator(1, cfg)
@@ -655,7 +657,7 @@ class Wav2vec_U(BaseFairseqModel):
 
         token_padding_mask = random_label == self.pad
 
-        # one_hot_x = F.one_hot(dense_x.argmax(dim=-1), num_classes=self.lm.config.vocab_size).float()
+        # one_hot_x = F.one_hot(dense_x.argmax(dim=-1), num_classes=self.vocab_size).float()
         # one_hot_x = one_hot_x - dense_x.detach() + dense_x # Straight through estimator
         
         entropy_gen = self.lm(dense_x)
@@ -664,8 +666,8 @@ class Wav2vec_U(BaseFairseqModel):
         dense_y = self.discriminator(entropy_gen, dense_padding_mask)
         token_y = self.discriminator(entropy_true, token_padding_mask)
 
-        acc_dense = (F.sigmoid(dense_y).round() == 1).float().mean()
-        acc_token = (F.sigmoid(token_y).round() == 0).float().mean()
+        score_dense = F.sigmoid(dense_y).mean()
+        score_token = F.sigmoid(token_y).mean()
 
         sample_size = features.size(0)
 
@@ -806,8 +808,8 @@ class Wav2vec_U(BaseFairseqModel):
             "prob_ppl": prob_perplexity,
             "d_steps": int(d_step),
             "sample_size": sample_size,
-            "acc_dense": acc_dense,
-            "acc_token": acc_token
+            "score_dense": score_dense,
+            "score_token": score_token
         }
 
         suff = "_d" if d_step else "_g"
