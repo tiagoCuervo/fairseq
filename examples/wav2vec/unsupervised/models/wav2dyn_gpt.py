@@ -45,7 +45,10 @@ class SegmentationConfig(FairseqDataclass):
 @dataclass
 class Wav2vec_UConfig(FairseqDataclass):
     log_gradients: bool = False 
+    tunable_gen_lm: bool = False
+    tunable_gen_lm_layers: int = -1
     
+    discriminator_relativistic: bool = False
     discriminator_type: str = "conv"
     discriminator_dim: int = 256
     discriminator_causal: bool = True
@@ -79,6 +82,9 @@ class Wav2vec_UConfig(FairseqDataclass):
     blank_mode: str = "add"
     blank_is_sil: bool = False
     no_softmax: bool = False
+    gan_on_embeddings: bool = False
+    gan_on_posteriograms: bool = True
+    compute_genseq_prob: bool = False
 
     smoothness_weight: float = 0.0
     smoothing: float = 0.0
@@ -548,24 +554,32 @@ class Wav2vec_U(BaseFairseqModel):
             self.max_temp * self.temp_decay ** num_updates, self.min_temp
         )
 
-    def discrim_step(self, num_updates):
-        return num_updates % 2 == 1
-
+    # def discrim_step(self, num_updates):
+    #     return num_updates % 2 == 1
+    
     def get_groups_for_update(self, num_updates):
-        return "discriminator" if self.discrim_step(num_updates) else "generator"
+        mod = self.n_groups
+        switch = num_updates % mod
+        if switch == 0:
+            return "generator"
+        elif switch == 1:
+            return "discriminator"
+        elif switch == 2:
+            return "lm"
 
     def __init__(self, cfg: Wav2vec_UConfig, target_dict):
-        super().__init__()
         # import ptvsd
         # ptvsd.enable_attach(('0.0.0.0', 7310))
         # print("Attach debugger now")
         # ptvsd.wait_for_attach()
 
+        super().__init__()
+
         self.cfg = cfg
         self.zero_index = target_dict.index("<SIL>") if "<SIL>" in target_dict else 0
         self.smoothness_weight = cfg.smoothness_weight
 
-        output_size = len(target_dict)
+        vocab_size = len(target_dict)
         self.pad = target_dict.pad()
         self.eos = target_dict.eos()
         self.smoothing = cfg.smoothing
@@ -605,12 +619,38 @@ class Wav2vec_U(BaseFairseqModel):
         # Re-arrange embeddings and output units so that the task codes will match the embeddings codes
         state_dict["transformer.wte.weight"] = state_dict["transformer.wte.weight"][indices]
         state_dict["lm_head.weight"] = state_dict["lm_head.weight"][indices]
-        self.lm = GPT(gptconf)
-        self.lm.load_state_dict(state_dict)
-        self.lm.eval()
-        # Freeze LM
-        for p in self.lm.parameters():
+        self.ref_lm = GPT(gptconf)
+        self.ref_lm.load_state_dict(state_dict)
+        self.ref_lm.eval()
+        # Freeze reference LM
+        for p in self.ref_lm.parameters():
             p.requires_grad = False
+        # If required, create separate generator LM and unfreeze tunable layers
+        if cfg.tunable_gen_lm:
+            self.n_groups = 3
+            self.gen_lm = GPT(gptconf)
+            self.gen_lm.load_state_dict(state_dict) # Initialize as the reference LM
+            if cfg.tunable_gen_lm_layers < 0:  # Tune specific layers 
+                # Tune only ln_f (lm_head is not tuned as it shares weights with the token embeddings)
+                for name, param in self.gen_lm.named_parameters():
+                    if name not in ["transformer.ln_f.weight", "transformer.ln_f.bias"]:
+                        param.requires_grad = False
+                # Make the specified transformer blocks trainable
+                n_blocks_to_update = min(abs(cfg.tunable_gen_lm_layers + 1), len(self.gen_lm.transformer.h))
+                if n_blocks_to_update > 0:
+                    for i, block in enumerate(self.gen_lm.transformer.h[::-1]):
+                        if i < n_blocks_to_update:
+                            for param in block.parameters():
+                                param.requires_grad = True
+            for p in self.gen_lm.parameters():
+                p.param_group = "lm"
+        else:
+            self.n_groups = 2
+            self.gen_lm = self.ref_lm
+
+        self.gan_on_embeddings = cfg.gan_on_embeddings
+        self.gan_on_posteriograms = cfg.gan_on_posteriograms
+        self.compute_genseq_prob = cfg.compute_genseq_prob
 
         if cfg.discriminator_type == "conv":
             discriminator_model = ConvDiscriminator
@@ -618,13 +658,21 @@ class Wav2vec_U(BaseFairseqModel):
             discriminator_model = TransformerDiscriminator
         else:
             raise NotImplementedError
-        self.discriminator = discriminator_model(output_size, cfg)
-        # self.discriminator = discriminator_model(self.lm.config.n_embd, cfg)
-        # self.discriminator = discriminator_model(1, cfg)
+        
+        if self.gan_on_embeddings:
+            disc_in_dim = self.ref_lm.config.n_embd
+        elif self.gan_on_posteriograms:
+            disc_in_dim = vocab_size
+        else:
+            disc_in_dim = 1
+        self.discriminator = discriminator_model(disc_in_dim, cfg)
+
         for p in self.discriminator.parameters():
             p.param_group = "discriminator"
 
-        self.generator = Generator(d, output_size, cfg)
+        self.discriminator_relativistic = cfg.discriminator_relativistic
+
+        self.generator = Generator(d, vocab_size, cfg)
 
         for p in self.generator.parameters():
             p.param_group = "generator"
@@ -641,7 +689,8 @@ class Wav2vec_U(BaseFairseqModel):
             if self.generator.residual:
                 self.decoder = nn.Linear(d, cfg.target_dim)
             else:
-                self.decoder = nn.Linear(output_size, cfg.target_dim)
+                self.decoder = nn.Linear(vocab_size, cfg.target_dim)
+                self.target_downsample_rate *= 3 # Accounting for downsampling of convolutional generator
             for p in self.decoder.parameters():
                 p.param_group = "generator"
 
@@ -731,10 +780,16 @@ class Wav2vec_U(BaseFairseqModel):
         dense_x_only=False,
         segment=True,
         aux_target=None,
+        debugging=False
     ):
+        turn = self.get_groups_for_update(self.update_num)
         if segment:
             features, padding_mask = self.segmenter.pre_segment(features, padding_mask)
 
+        # if turn == "generator": 
+        #     gen_result = self.generator(features, random_label, padding_mask)
+        # else:
+        #     with torch.no_grad():
         gen_result = self.generator(features, random_label, padding_mask)
 
         orig_dense_x, token_x = gen_result["dense_x"], gen_result["token_x"]
@@ -762,22 +817,47 @@ class Wav2vec_U(BaseFairseqModel):
             }
 
         token_padding_mask = random_label == self.pad
-
-        # one_hot_x = F.one_hot(dense_x.argmax(dim=-1), num_classes=self.lm.config.vocab_size).float()
-        # one_hot_x = one_hot_x - dense_x.detach() + dense_x # Straight through estimator
+            
+        lm_emb_gen, lm_logits_gen, lm_probs_gen, lm_ent_gen = self.gen_lm(
+                dense_x[:, :self.block_size, :],
+                self.gan_on_embeddings and not turn == "lm",
+                turn == "lm" and self.gan_on_embeddings,
+                self.gan_on_posteriograms)
         
-        entropy_gen = self.lm(dense_x[:, :self.block_size, :])
-        entropy_true = self.lm(token_x[:, :self.block_size, :])
+        lm_emb_true, lm_logits_true, lm_probs_true, lm_ent_true = self.ref_lm(
+                token_x[:, :self.block_size, :],
+                self.gan_on_embeddings,
+                False,
+                self.gan_on_posteriograms)
 
-        dense_y = self.discriminator(entropy_gen, dense_padding_mask[:, :self.block_size])
-        token_y = self.discriminator(entropy_true, token_padding_mask[:, :self.block_size])
+        disc_t_offset = 0
+        if self.gan_on_embeddings:
+            disc_in_gen = lm_emb_gen
+            disc_in_true = lm_emb_true
+        elif self.gan_on_posteriograms:
+            if self.compute_genseq_prob:
+                disc_t_offset = -1
+                disc_in_gen = lm_probs_gen[:, :-1, :] * dense_x[:, 1:self.block_size, :]
+                disc_in_true = lm_probs_true[:, :-1, :] * token_x[:, 1:self.block_size, :]
+            else:
+                disc_in_gen = lm_probs_gen
+                disc_in_true = lm_probs_true
+        else:
+            disc_in_gen = lm_ent_gen
+            disc_in_true = lm_ent_true
 
-        score_dense = F.sigmoid(dense_y).mean()
-        score_token = F.sigmoid(token_y).mean()
+        dense_y = self.discriminator(disc_in_gen, dense_padding_mask[:, :self.block_size + disc_t_offset])
+        token_y = self.discriminator(disc_in_true, token_padding_mask[:, :self.block_size + disc_t_offset])
+
+        
+        if self.discriminator_relativistic:
+            score_dense = F.sigmoid(dense_y - token_y).mean()
+            score_token = F.sigmoid(token_y - dense_y).mean()
+        else:
+            score_dense = F.sigmoid(dense_y).mean()
+            score_token = F.sigmoid(token_y).mean()
 
         sample_size = features.size(0)
-
-        d_step = self.discrim_step(self.update_num)
 
         fake_smooth = self.smoothing
         real_smooth = self.smoothing
@@ -787,62 +867,108 @@ class Wav2vec_U(BaseFairseqModel):
         smoothness_loss = None
         code_pen = None
         mmi_loss = None
-
+        grad_pen = None
+        
+        if self.discriminator_relativistic:
+            loss_d = None
+            loss_g = None
+        else:
+            loss_token = None
+            loss_dense_d = None
+            loss_dense_g = None
+        
+        lm_loss = None
+        inter_x = None
         if self.log_gradients:
             grad_dense_lm = None
             grad_dense_g = None
             grad_mmi_g = None
             grad_smoothness_g = None
             grad_code_pen_g = None
-        if d_step:
-            loss_dense = F.binary_cross_entropy_with_logits(
-                dense_y,
-                dense_y.new_ones(dense_y.shape) - fake_smooth,
-                reduction="sum",
-            )
-            loss_token = F.binary_cross_entropy_with_logits(
-                token_y,
-                token_y.new_zeros(token_y.shape) + real_smooth,
-                reduction="sum",
-            )
-            if self.training and self.gradient_penalty > 0:
-                grad_pen = self.calc_gradient_penalty(entropy_true, entropy_gen)
-                grad_pen = grad_pen.sum() * self.gradient_penalty
+
+        if turn == "discriminator" or debugging:
+            if self.discriminator_relativistic:
+                # loss_d = F.binary_cross_entropy_with_logits(
+                #     (token_y - dense_y),
+                #     dense_y.new_ones(dense_y.shape),
+                #     reduction="sum",
+                # )
+                loss_token = F.binary_cross_entropy_with_logits(
+                    (token_y - torch.mean(dense_y)),
+                    dense_y.new_ones(dense_y.shape),
+                    reduction="sum",
+                )
+                
+                loss_dense_d = F.binary_cross_entropy_with_logits(
+                    (dense_y - torch.mean(token_y)),
+                    dense_y.new_zeros(dense_y.shape),
+                    reduction="sum",
+                )
+                loss_d = (loss_token + loss_dense_d) / 2
             else:
-                grad_pen = None
+                loss_d = loss_dense_d = F.binary_cross_entropy_with_logits(
+                    dense_y,
+                    dense_y.new_ones(dense_y.shape) - fake_smooth,
+                    reduction="sum",
+                )
+                loss_token = F.binary_cross_entropy_with_logits(
+                    token_y,
+                    token_y.new_zeros(token_y.shape) + real_smooth,
+                    reduction="sum",
+                )
+            if self.training and self.gradient_penalty > 0:
+                grad_pen = self.calc_gradient_penalty(disc_in_true, disc_in_gen)
+                grad_pen = grad_pen.sum() * self.gradient_penalty
+
             if self.log_gradients:
                 grad_dense_lm = torch.norm(autograd.grad(
-                    outputs=loss_dense,
-                    inputs=entropy_gen,
+                    outputs=loss_d,
+                    inputs=disc_in_gen,
                     create_graph=True,
                     retain_graph=True,
                     only_inputs=True
                 )[0])
                 grad_dense_g = torch.norm(autograd.grad(
-                    outputs=loss_dense,
+                    outputs=loss_d,
                     inputs=dense_x,
                     create_graph=True,
                     retain_graph=True,
                     only_inputs=True
                 )[0])
-        else:
-            grad_pen = None
-            loss_token = None
-            loss_dense = F.binary_cross_entropy_with_logits(
-                dense_y,
-                dense_y.new_zeros(dense_y.shape) + fake_smooth,
-                reduction="sum",
-            )
+        if turn == "generator" or debugging:
+            if self.discriminator_relativistic:
+                # loss_g = F.binary_cross_entropy_with_logits(
+                #     (dense_y - token_y),
+                #     dense_y.new_ones(dense_y.shape),
+                #     reduction="sum",
+                # )
+                loss_dense_g = F.binary_cross_entropy_with_logits(
+                    (token_y - torch.mean(dense_y)),
+                    dense_y.new_zeros(dense_y.shape),
+                    reduction="sum",
+                )
+                loss_token = F.binary_cross_entropy_with_logits(
+                    (dense_y - torch.mean(token_y)),
+                    dense_y.new_ones(dense_y.shape),
+                    reduction="sum",
+                )
+                loss_g = (loss_dense_g + loss_token) / 2
+            else:
+                loss_g = loss_dense_g = F.binary_cross_entropy_with_logits(
+                    dense_y,
+                    dense_y.new_zeros(dense_y.shape) + fake_smooth,
+                    reduction="sum",
+                )
             if self.log_gradients:
                 grad_dense_lm = torch.norm(autograd.grad(
-                    outputs=loss_dense,
-                    inputs=entropy_gen,
+                    outputs=loss_g,
+                    inputs=disc_in_gen,
                     create_graph=True,
                     retain_graph=True,
                     only_inputs=True
                 )[0])
                 grad_dense_g = torch.norm(autograd.grad(
-                    outputs=loss_dense,
+                    outputs=loss_g,
                     inputs=dense_x,
                     create_graph=True,
                     retain_graph=True,
@@ -862,22 +988,22 @@ class Wav2vec_U(BaseFairseqModel):
                     )[0])
 
             if self.smoothness_weight > 0:
-                smoothness_loss = F.mse_loss(
-                    dense_logits[:, :-1], dense_logits[:, 1:], reduction="none"
-                )
                 # smoothness_loss = F.mse_loss(
-                #     orig_dense_x[:, :-1], orig_dense_x[:, 1:], reduction="none"
+                    # dense_logits[:, :-1], dense_logits[:, 1:], reduction="none"
                 # )
-                smoothness_loss[dense_padding_mask[:, 1:]] = 0
-                # smoothness_loss[orig_dense_padding_mask[:, 1:]] = 0
+                smoothness_loss = F.mse_loss(
+                    orig_dense_x[:, :-1], orig_dense_x[:, 1:], reduction="none"
+                )
+                # smoothness_loss[dense_padding_mask[:, 1:]] = 0
+                smoothness_loss[orig_dense_padding_mask[:, 1:]] = 0
                 smoothness_loss = (
                     smoothness_loss.mean() * sample_size * self.smoothness_weight
                 )
                 if self.log_gradients:
                     grad_smoothness_g = torch.norm(autograd.grad(
                         outputs=smoothness_loss,
-                        inputs=dense_logits,
-                        # inputs=orig_dense_x,
+                        # inputs=dense_logits,
+                        inputs=orig_dense_x,
                         create_graph=True,
                         retain_graph=True,
                         only_inputs=True
@@ -885,10 +1011,12 @@ class Wav2vec_U(BaseFairseqModel):
             if (self.mmi_weight > 0) and (aux_target is not None):
                 if self.generator.residual:
                     inter_x = self.decoder(gen_result["inter_x"])
+                    inter_mask = padding_mask
                 else:
                     inter_x = self.decoder(orig_dense_x)
+                    inter_mask = orig_dense_padding_mask
                 if self.target_downsample_rate > 1:
-                    aux_target = aux_target[:, :: self.target_downsample_rate]
+                    aux_target = aux_target[:, :: self.target_downsample_rate]  
                 max_t_len = min(aux_target.shape[1], inter_x.shape[1])
                 mmi_loss = F.cross_entropy(
                     inter_x[:, :max_t_len].transpose(1, 2),
@@ -896,6 +1024,7 @@ class Wav2vec_U(BaseFairseqModel):
                     ignore_index=-1,
                     reduction="none",
                 )
+                mmi_loss[inter_mask[:, :max_t_len]] = 0
                 mmi_loss = mmi_loss.mean() * mmi_loss.shape[0] * self.mmi_weight
                 if self.log_gradients:
                     grad_mmi_g = torch.norm(autograd.grad(
@@ -905,26 +1034,46 @@ class Wav2vec_U(BaseFairseqModel):
                         retain_graph=True,
                         only_inputs=True
                     )[0])
+        if turn == "lm":
+            lm_targets = dense_x.argmax(dim=-1)[:, 1:self.block_size].long()
+            lm_loss = F.cross_entropy(lm_logits_gen[:, :-1, :].reshape(-1, lm_logits_gen.size(-1)), 
+                                      lm_targets.reshape(-1), reduction="none")
+            lm_loss_mask = dense_padding_mask[:, :lm_logits_gen.size(1) - 1].reshape(-1)
+            lm_loss = lm_loss[~lm_loss_mask]
+            lm_loss = lm_loss.mean() # * lm_loss.shape[0] 
 
         result = {
             "losses": {
                 "grad_pen": grad_pen,
                 "code_pen": code_pen,
                 "smoothness": smoothness_loss,
-                "mmi": mmi_loss,    
+                "mmi": mmi_loss,
+                "lm": lm_loss,
+                # "dense_d": loss_dense_d,
+                # "dense_g": loss_dense_g,
+                # "token_d": loss_token
             },
             "temp": self.curr_temp,
             "code_ppl": code_perplexity,
             "prob_ppl": prob_perplexity,
-            "d_steps": int(d_step),
+            "d_steps": int(turn == "discriminator"),
             "sample_size": sample_size,
             "score_dense": score_dense,
             "score_token": score_token
         }
 
-        suff = "_d" if d_step else "_g"
-        result["losses"]["dense" + suff] = loss_dense
-        result["losses"]["token" + suff] = loss_token
+        if debugging:
+            result["posteriogram"] = orig_dense_x
+            result["posteriogram_mask"] = orig_dense_padding_mask
+            result["inter_x"] = inter_x
+
+        if self.discriminator_relativistic:
+            result["losses"]["d"] = loss_d
+            result["losses"]["g"] = loss_g
+        else:
+            result["losses"]["dense_d"] = loss_dense_d
+            result["losses"]["dense_g"] = loss_dense_g
+            result["losses"]["token_d"] = loss_token
 
         if self.log_gradients:
             result["grad_dense_lm"] = grad_dense_lm

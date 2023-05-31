@@ -34,7 +34,7 @@ task:
   aux_target_postfix: km
 
 dataset:
-  num_workers: 2
+  num_workers: 0
   batch_size: 160
   skip_invalid_size_inputs_valid_test: true
   valid_subset: valid
@@ -76,7 +76,7 @@ optimizer:
         _name: fixed
         warmup_updates: 2000
     discriminator:
-      lr: [ 0.0003 ]
+      lr: [0.0003]
       lr_float: null
       optimizer:
         _name: adam
@@ -87,12 +87,25 @@ optimizer:
       lr_scheduler:
         _name: fixed
         warmup_updates: 0
+    # lm:
+    #   lr: [0.0003]
+    #   lr_float: null
+    #   optimizer:
+    #     _name: adam
+    #     adam_betas: [0.5,0.98]
+    #     adam_eps: 1e-06
+    #     weight_decay: 0
+    #     amsgrad: false
+    #   lr_scheduler:
+    #     _name: cosine
+    #     warmup_updates: 2000
 
 lr_scheduler: pass_through
 
 model:
   _name: wav2dyn_gpt
 
+  discriminator_relativistic: false
   discriminator_type: conv
   discriminator_dim: 384
   discriminator_depth: 2
@@ -126,6 +139,11 @@ model:
   lm_ckpt: ???
 
   log_gradients: false
+  tunable_gen_lm: false
+  tunable_gen_lm_layers: -1
+  gan_on_embeddings: false
+  gan_on_posteriograms: false
+  compute_genseq_prob: false
 
   segmentation:
     type: JOIN

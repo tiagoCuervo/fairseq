@@ -165,7 +165,11 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, token_probs, return_logits=False):
+    def forward(self, token_probs, return_embeddings=False, return_logits=False, return_posteriograms=False):
+        assert (
+            (return_embeddings ^ return_logits ^ return_posteriograms) or
+            (not return_embeddings and not return_logits and not return_posteriograms)
+        ), "Choose only one of return_embeddings, return_logits, or return_entropy as LM output"
         device = token_probs.device
         b, t, vocab_size = token_probs.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -178,17 +182,16 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        # return x
-
+        if return_embeddings:
+            return x, None, None, None
         logits = self.lm_head(x)
-        # default_tokens_mask = torch.zeros((1, 1, vocab_size), device=logits.device)
-        # default_tokens_mask[..., :4] = -1e4
-        # logits += default_tokens_mask
         if return_logits:
-            return logits
+            return x, logits, None, None
         probs = F.softmax(logits, dim=-1)
-        return probs
-        # return -torch.sum(probs * torch.log(probs), dim=-1, keepdim=True)
+        if return_posteriograms:
+            return x, logits, probs, None
+        entropy = -torch.sum(probs * torch.log(probs), dim=-1, keepdim=True)
+        return x, logits, probs, entropy
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -202,7 +205,7 @@ class GPT(nn.Module):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             idx_cond = F.one_hot(idx_cond, num_classes=self.config.vocab_size).float()
             # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond, return_logits=True)
+            _, logits, _, _ = self(idx_cond, return_logits=True)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

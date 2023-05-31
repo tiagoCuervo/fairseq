@@ -97,7 +97,7 @@ class ModelCriterion(FairseqCriterion):
                     for i, v in enumerate(net_output[lk]):
                         logging_output[f"{lk}_{i}"] = float(v)
 
-        if len(scaled_losses) > 1:
+        if len(scaled_losses) > 0:
             for lk, l in scaled_losses.items():
                 if l.numel() > 1:
                     l = l.sum()
