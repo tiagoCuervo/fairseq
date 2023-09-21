@@ -1,0 +1,71 @@
+# @package _group_
+
+common:
+  fp16: false
+  fp16_no_flatten_grads: true
+  log_format: json
+  log_interval: 100
+  reset_logging: false
+  suppress_crashes: false
+  wandb_project: "cpc2"
+  wandb_entity: "indy-lis"
+
+checkpoint:
+  save_interval: 1000
+  save_interval_updates: 1000
+  keep_interval_updates: 1
+  no_epoch_checkpoints: true
+  best_checkpoint_metric: acc
+  save_dir: .
+
+distributed_training:
+  distributed_world_size: 1
+
+task:
+  _name: cpc2_recon
+  data: ???
+  labels: km
+  sort_by_length: false
+  max_length: null
+
+dataset:
+  num_workers: 0
+  batch_size: 160
+  skip_invalid_size_inputs_valid_test: true
+  valid_subset: valid
+  validate_interval: 1000
+  validate_interval_updates: 1000
+
+criterion:
+  _name: model
+  log_keys:
+    - acc_s
+    - acc_n
+
+optimization:
+  max_update: 30000
+  lr: [0.00003]
+  sentence_avg: true
+  update_freq: [1]
+
+optimizer:
+  _name: adam
+  adam_betas: (0.9,0.98)
+  adam_eps: 1e-08
+
+lr_scheduler:
+  _name: cosine
+  warmup_updates: 2000
+  warmup_init_lr: 1e-08
+
+model:
+  _name: wav2sn
+
+  in_dim: 1280
+  dim: 32
+  causal: false
+  dropout: 0.1
+  bias: false
+  nhead: 1
+  huber_loss: false
+  avg_pool: false

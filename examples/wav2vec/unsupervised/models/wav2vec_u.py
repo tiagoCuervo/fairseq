@@ -699,6 +699,7 @@ class Wav2vec_U(BaseFairseqModel):
 
             if (self.mmi_weight > 0) and (aux_target is not None):
                 inter_x = self.decoder(gen_result["inter_x"])
+                inter_mask = padding_mask
                 if self.target_downsample_rate > 1:
                     aux_target = aux_target[:, :: self.target_downsample_rate]
                 max_t_len = min(aux_target.shape[1], inter_x.shape[1])
@@ -708,6 +709,7 @@ class Wav2vec_U(BaseFairseqModel):
                     ignore_index=-1,
                     reduction="none",
                 )
+                mmi_loss[inter_mask[:, :max_t_len]] = 0
                 mmi_loss = mmi_loss.mean() * mmi_loss.shape[0] * self.mmi_weight
                 if self.log_gradients:
                     grad_mmi_g = torch.norm(autograd.grad(

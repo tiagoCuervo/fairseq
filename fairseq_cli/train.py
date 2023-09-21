@@ -323,13 +323,14 @@ def train(
     )
     progress.update_config(_flatten_config(cfg))
 
-    if epoch_itr.next_epoch_idx == 1:
+    if epoch_itr.next_epoch_idx == 1 and cfg.common.wandb_project is not None:
         wandb.watch(
             trainer.model,
             log="gradients",
             log_freq=cfg.common.log_interval,
             idx=0
         )
+        # wandb.run.log_code("../examples/wav2vec/unsupervised/models")
 
     trainer.begin_epoch(epoch_itr.epoch)
 
