@@ -89,7 +89,7 @@ optimizer:
 lr_scheduler: pass_through
 
 model:
-  _name: wav2vec_u
+  _name: wav2vec_u_lm
 
   # discriminator_relativistic: false
   discriminator_dim: 384
@@ -116,12 +116,12 @@ model:
   hard_gumbel: false
   gradient_penalty: 1.0
   code_penalty: 3.0
-  # bitrate_penalty: 0
-  # bitrate_prior: 1.13
   temp: [ 2,0.1,0.99995 ]
   input_dim: 1024
   mmi_weight: 0.5
   target_dim: 64
+
+  lm_ckpt: ???
 
   log_gradients: false
 

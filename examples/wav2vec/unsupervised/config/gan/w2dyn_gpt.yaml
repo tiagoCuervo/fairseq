@@ -34,7 +34,7 @@ task:
   aux_target_postfix: km
 
 dataset:
-  num_workers: 0
+  num_workers: 2
   batch_size: 160
   skip_invalid_size_inputs_valid_test: true
   valid_subset: valid
@@ -48,7 +48,6 @@ criterion:
     - code_ppl
     - score_dense
     - score_token
-    - grad_token_lm
     - grad_dense_lm
     - grad_dense_g
     - grad_mmi_g

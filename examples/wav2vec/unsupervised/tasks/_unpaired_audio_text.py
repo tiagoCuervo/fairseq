@@ -59,7 +59,7 @@ class UnpairedAudioTextConfig(FairseqDataclass):
     )
     aux_target_postfix: Optional[str] = field(
         default=None,
-        metadata={"help": "auxaliry target filename extension"},
+        metadata={"help": "auxiliary target filename extension"},
     )
     unfiltered: bool = field(
         default=False, metadata={"help": "load data with _unfiltered suffix"}
