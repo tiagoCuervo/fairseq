@@ -1,10 +1,13 @@
 import math
 from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from fairseq.modules import SamePad
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -41,24 +44,20 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
 
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.max_seq_len = config.block_size
         
-        if not self.flash or config.context_width != -1:
+        if config.context_width != -1:
             # causal mask to ensure that attention is only applied to the left in the input sequence
             attn_mask = torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
-            if config.context_width != -1:
-                # Local attention
-                window_mask = torch.triu(torch.ones(config.block_size, config.block_size, dtype=torch.bool), 
-                                         -(config.context_width - 1))
-                attn_mask *= window_mask
-                attn_mask = attn_mask.view(1, 1, config.block_size, config.block_size)
+            # Local attention
+            window_mask = torch.triu(torch.ones(config.block_size, config.block_size, dtype=torch.bool), 
+                                        -(config.context_width - 1))
+            attn_mask *= window_mask
+            attn_mask = attn_mask.view(1, 1, config.block_size, config.block_size)
             self.register_buffer("bias", attn_mask)
         else:
             self.bias = None
         
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
         if pos_emb:
             d_head = config.n_embd // config.n_head
             # Positional encoding
@@ -72,7 +71,10 @@ class CausalSelfAttention(nn.Module):
         else:
             self.pe = None
 
-    def forward(self, x):
+    def forward(self, x, 
+                input_pos: Optional[torch.Tensor] = None, 
+                kv_cache: Optional[KVCache] = None):
+        assert kv_cache is None or (input_pos is not None and kv_cache is not None), "For kv caching input_pos must be provided"
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -82,28 +84,30 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if self.pe is not None:
-            pe = self.pe[:, :, :T].to(x.device)
+            if kv_cache is None:
+                pe = self.pe[:, :, :T]
+            else:
+                pe = self.pe.index_select(2, input_pos)
             k = k + pe
             q = q + pe
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None if self.bias is None else self.bias[:,:,:T,:T], 
-                                                                 dropout_p=self.dropout if self.training else 0, 
-                                                                 is_causal=True if self.bias is None else False)
+        if kv_cache is not None:
+            cache_k, cache_v = kv_cache # (b, n_head, block_size, head_size)
+            kv_cache = cache_k.index_copy(2, input_pos, k), cache_v.index_copy(2, input_pos, v)
+            T = input_pos[-1] + 1
+            k = kv_cache[0][:, :, :T, :]
+            v = kv_cache[1][:, :, :T, :]
+            attn_mask = None if self.bias is None else self.bias.index_select(2, input_pos)[:,:,:,:T]
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+            attn_mask = None if self.bias is None else self.bias[:,:,:T,:T]
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, 
+                                                                dropout_p=self.dropout if self.training else 0, 
+                                                                is_causal=True if (self.bias is None and kv_cache is None) else False)
+        y = y.transpose(1, 2).contiguous().view(B, -1, C) # re-assemble all head outputs side by side
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, kv_cache
 
 class MLP(nn.Module):
 
@@ -131,11 +135,17 @@ class Block(nn.Module):
             self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
             self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, 
+                input_pos: Optional[torch.Tensor] = None, 
+                kv_cache: Optional[KVCache] = None):
+        h, new_kv_cache = self.attn(self.ln_1(x), input_pos, kv_cache)
+        x = x + h
         if not self.attention_only:
             x = x + self.mlp(self.ln_2(x))
-        return x
+        if new_kv_cache is not None:
+            return x, new_kv_cache
+        else:
+            return x
 
 @dataclass
 class GPTConfig:
@@ -180,6 +190,8 @@ class GPT(nn.Module):
             # not 100% sure what this is, so far seems to be harmless. TODO investigate
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        self.kv_caches: List[KVCache] = []
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -214,7 +226,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, token_probs, return_embeddings=False, return_logits=False, return_posteriograms=False):
+    def forward(self, token_probs, return_embeddings=False, return_logits=False, return_posteriograms=False, input_pos: Optional[torch.Tensor] = None):
         assert (
             (return_embeddings ^ return_logits ^ return_posteriograms) or
             (not return_embeddings and not return_logits and not return_posteriograms)
@@ -232,8 +244,19 @@ class GPT(nn.Module):
         else:
             x = self.transformer.drop(tok_emb)
         if self.config.n_layer > 0:
-            for block in self.transformer.h:
-                x = block(x)
+            if input_pos is None:  # proxy for use_cache=False
+                for block in self.transformer.h:
+                    x = block(x)
+            else:
+                if not self.kv_caches:
+                    head_size = self.config.n_embd // self.config.n_head
+                    cache_shape = (b, self.config.n_head, self.config.block_size, head_size)
+                    self.kv_caches = [
+                        (torch.zeros(cache_shape, device=x.device, dtype=x.dtype), torch.zeros(cache_shape, device=x.device, dtype=x.dtype))
+                        for _ in range(self.config.n_layer)
+                    ]
+                for i, block in enumerate(self.transformer.h):
+                    x, self.kv_caches[i] = block(x, input_pos, self.kv_caches[i])
         if "ln_f" in self.transformer:
             x = self.transformer.ln_f(x)
         if return_embeddings:
@@ -246,6 +269,9 @@ class GPT(nn.Module):
             return x, logits, probs, None
         entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1, keepdim=True)
         return x, logits, probs, entropy
+    
+    def reset_cache(self) -> None:
+        self.kv_caches.clear()
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, mask=None, min_len=None, eos_token=None):
@@ -281,6 +307,38 @@ class GPT(nn.Module):
 
         return idx
 
+    @torch.no_grad()
+    def fast_generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, mask=None, min_len=None, eos_token=None):    
+        assert idx.size(1) + max_new_tokens <= self.config.block_size, "Generation of sequences larger than the context window is not supported"
+        assert min_len is None or (eos_token is not None), "If min_len is set then eos_token must be specified"
+        t = idx.size(1)
+        input_pos = torch.arange(0, t, device=idx.device)
+        for i in range(max_new_tokens):
+            x = idx.index_select(1, input_pos)
+            idx_cond = F.one_hot(x, num_classes=self.config.vocab_size).float()
+            # forward the model to get the logits for the index in the sequence
+            _, logits, _, _ = self(idx_cond, return_logits=True, input_pos=input_pos)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # optionally forbid some tokens by adding a bias to the logits
+            if mask is not None:
+                logits += mask
+            if i < min_len: # Forbid from making 
+                logits[:, eos_token] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+            # advance index pointer
+            input_pos = input_pos[-1:] + 1
+        self.reset_cache()
+        return idx
 
 class ConvLM(nn.Module):
     def __init__(self, 

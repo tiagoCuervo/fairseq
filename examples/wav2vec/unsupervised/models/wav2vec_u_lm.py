@@ -648,8 +648,8 @@ class Wav2vec_U_LM(BaseFairseqModel):
             #                                mask=forbid_tokens_mask)
             
             # Sample from LM, making sure to generate sentences of at least len MIN_SEG_LEN
-            token_x = self.ref_lm.generate(start_tokens, self.ref_lm.config.block_size, min_len=MIN_SEG_LEN, 
-                                           eos_token=self.eos)
+            token_x = self.ref_lm.fast_generate(start_tokens, self.ref_lm.config.block_size - 1, min_len=MIN_SEG_LEN, 
+                                                eos_token=self.eos)
             # Just take single sentences (i.e. tokens up to first ocurrence of eos token)
             token_x_lens = (token_x == self.eos).int().argmax(dim=1)
             token_x_lens[token_x_lens == 0] = token_x.size(1) # if any sentence hasn't finished just take the whole sentence
