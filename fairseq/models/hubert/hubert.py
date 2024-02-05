@@ -192,6 +192,13 @@ class HubertConfig(FairseqDataclass):
         metadata={"help": "number of groups for convolutional positional embedding"},
     )
 
+    conv_pos_batch_norm: bool = field(
+        default=False,
+        metadata={
+            "help": "use batch norm instead of weight norm in conv_pos (for bf16 models)"
+        },
+    )
+
     latent_temp: Tuple[float, float, float] = field(
         default=(2, 0.5, 0.999995),
         metadata={"help": "legacy (to be removed)"},
@@ -464,14 +471,14 @@ class HubertModel(BaseFairseqModel):
         # x: (B, T, D), float
         # padding_mask: (B, T), bool
         # mask_indices: (B, T), bool
-        x, _ = self.encoder(
+        x, layer_results = self.encoder(
             x,
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1,
         )
 
         if features_only:
-            return {"x": x, "padding_mask": padding_mask, "features": features}
+            return {"x": x, "padding_mask": padding_mask, "features": features, "layer_results": layer_results}
 
         def compute_pred(proj_x, target, label_embs):
             # compute logits for the i-th label set
