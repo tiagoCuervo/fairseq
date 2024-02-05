@@ -15,7 +15,7 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 
 def get_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("data", help="Path with .tsv files pointing to the audio data")
+    parser.add_argument("data", help="Path with .csv files pointing to the audio data")
     parser.add_argument("--split", help="Which split", required=True)
     parser.add_argument("--save-dir", help="Output path to store the features", required=True)
     parser.add_argument("--checkpoint", help="Path to the WavLM checkpoint", required=True)
@@ -23,10 +23,10 @@ def get_parser():
 
 
 def get_iterator(args, mdl, cfg):
-    with open(os.path.join(args.data, args.split) + ".tsv", "r") as fp:
+    with open(os.path.join(args.data, args.split) + ".csv", "r") as fp:
         lines = fp.read().split("\n")
-        root = lines.pop(0).strip()
-        files = [os.path.join(root, line.split("\t")[0]) for line in lines if len(line) > 0]
+        root = "EnglishCCC_v1.2/confusionWavs/"
+        files = [os.path.join(root, f'T_{line.split(",")[0]}.wav') for line in lines if len(line) > 0]
         num = len(files)
 
         def iterate():

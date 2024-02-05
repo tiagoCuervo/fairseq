@@ -146,3 +146,4 @@ outputs
 *.txt
 *.tsv
 *.pt
+examples/wav2itl/data/EnglishCCC_v1.2*

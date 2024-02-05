@@ -7,7 +7,7 @@ common:
   log_interval: 100
   reset_logging: false
   suppress_crashes: false
-  wandb_project: "cpc2"
+  wandb_project: "eccc"
   wandb_entity: "indy-lis"
 
 checkpoint:
@@ -22,7 +22,7 @@ distributed_training:
   distributed_world_size: 1
 
 task:
-  _name: cpc2
+  _name: eccc
   data: ???
   labels: itl
   sort_by_length: false
