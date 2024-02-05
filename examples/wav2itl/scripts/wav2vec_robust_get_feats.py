@@ -3,7 +3,6 @@ import torch
 import os
 import numpy as np
 import fairseq
-import skimage.measure
 import argparse
 import soundfile as sf
 from shutil import copyfile
@@ -15,7 +14,7 @@ from omegaconf import OmegaConf
 
 def get_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("data", help="Path with .tsv files pointing to the audio data")
+    parser.add_argument("data", help="Path with .csv files pointing to the audio data")
     parser.add_argument("--split", help="Which split", required=True)
     parser.add_argument("--save-dir", help="Output path to store the features", required=True)
     parser.add_argument("--checkpoint", help="Path to the WavLM checkpoint", required=True)
@@ -23,45 +22,30 @@ def get_parser():
 
 
 def get_iterator(args, mdl, cfg):
-    with open(os.path.join(args.data, args.split) + ".tsv", "r") as fp:
+    with open(os.path.join(args.data, args.split) + ".csv", "r") as fp:
         lines = fp.read().split("\n")
-        root = lines.pop(0).strip()
-        files = [os.path.join(root, line.split("\t")[0]) for line in lines if len(line) > 0]
+        lines.pop(0)
+        root = os.path.join(args.data, "confusionWavs")
+        # first column is for index, second is for token ID which allows to rebuild the waveform filename
+        files = [os.path.join(root, f'T_{line.split(",")[1]}.wav') for line in lines if len(line) > 0]
         num = len(files)
-
+        
         def iterate():
             for fname in files:
                 # feats = reader.get_feats(fname)
                 wav, sr = sf.read(fname)
                 wav = torch.from_numpy(wav).float().cuda()
                 if wav.dim() > 1:
-                    feats = []
-                    for d in range(wav.dim()):
-                        m_in = wav[:, d].view(1, -1)
-                        with torch.no_grad():   
-                            if cfg.task.normalize:
-                                m_in = torch.nn.functional.layer_norm(m_in , m_in.shape)
-                            audio_rep = mdl(source=m_in, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]                            
-                            audio_rep = [rep[0] for rep in audio_rep]
-                            audio_rep = torch.concatenate(audio_rep, dim=1).transpose(1, 0)
-                            audio_rep = audio_rep.cpu().numpy()
-                        audio_rep = skimage.measure.block_reduce(audio_rep, (1, 20, 1), np.mean) # downsample x20
-                        audio_rep = np.transpose(audio_rep, (1, 0, 2)) # [time, heads, width]
-                        feats.append(audio_rep)
-                    yield np.concatenate([np.expand_dims(feats[0], axis=1), 
-                                          np.expand_dims(feats[1], axis=1)], axis=1)
-                else:
-                    wav = wav.view(1, -1)
-                    with torch.no_grad():
-                        if cfg.task.normalize:
-                            wav = torch.nn.functional.layer_norm(wav , wav.shape)
-                        audio_rep = mdl(source=wav, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]      
-                        audio_rep = [rep[0] for rep in audio_rep]
-                        audio_rep = torch.concatenate(audio_rep, dim=1).transpose(1, 0)
-                        audio_rep = audio_rep.cpu().numpy()
-                    audio_rep = skimage.measure.block_reduce(audio_rep, (1, 20, 1), np.mean) # downsample x20
-                    audio_rep = np.transpose(audio_rep, (1, 0, 2))
-                    yield audio_rep
+                    wav = torch.mean(wav, dim=1)        
+                wav = wav.view(1, -1)
+                with torch.no_grad():
+                    if cfg.task.normalize:
+                        wav = torch.nn.functional.layer_norm(wav , wav.shape)
+                    audio_rep = mdl(source=wav, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]      
+                    audio_rep = [rep[0] for rep in audio_rep]
+                    audio_rep = torch.concatenate(audio_rep, dim=1)
+                    audio_rep = audio_rep.cpu().numpy()
+                yield audio_rep
     return iterate, num
 
 
@@ -72,7 +56,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     def create_files(dest):
-        copyfile(os.path.join(args.data, args.split) + ".tsv", dest + ".tsv")
+        copyfile(os.path.join(args.data, args.split) + ".csv", dest + ".csv")
         if os.path.exists(os.path.join(args.data, args.split) + ".itl"):
             copyfile(os.path.join(args.data, args.split) + ".itl", dest + ".itl")
         if os.path.exists(os.path.join(args.data, args.split) + ".lis"):
@@ -83,7 +67,7 @@ def main():
         npaa = NpyAppendArray(dest + ".npy")
         return npaa
 
-    save_path = os.path.join(args.save_dir, args.split)
+    save_path = os.path.join(args.save_dir, "wav2vec_robust."+args.split)
     npaa = create_files(save_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,7 +114,6 @@ def main():
             if len(feats.shape) == 2:
                 feats = np.repeat(np.expand_dims(feats, axis=1), repeats=2, axis=1)
             print(len(feats), file=l_f)
-
             if len(feats) > 0:
                 npaa.append(np.ascontiguousarray(feats))
     del model

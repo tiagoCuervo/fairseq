@@ -3,7 +3,6 @@ import torch
 import os
 import numpy as np
 import fairseq
-import skimage.measure
 import argparse
 import soundfile as sf
 from shutil import copyfile
@@ -25,8 +24,9 @@ def get_parser():
 def get_iterator(args, mdl, cfg):
     with open(os.path.join(args.data, args.split) + ".csv", "r") as fp:
         lines = fp.read().split("\n")
-        root = "EnglishCCC_v1.2/confusionWavs/"
-        files = [os.path.join(root, f'T_{line.split(",")[0]}.wav') for line in lines if len(line) > 0]
+        lines.pop(0)
+        root = os.path.join(args.data, "confusionWavs")
+        files = [os.path.join(root, f'T_{line.split(",")[1]}.wav') for line in lines if len(line) > 0]
         num = len(files)
 
         def iterate():
@@ -35,33 +35,17 @@ def get_iterator(args, mdl, cfg):
                 wav, sr = sf.read(fname)
                 wav = torch.from_numpy(wav).float().cuda()
                 if wav.dim() > 1:
-                    feats = []
-                    for d in range(wav.dim()):
-                        m_in = wav[:, d].view(1, -1)
-                        with torch.no_grad():   
-                            if cfg.task.normalize:
-                                m_in = torch.nn.functional.layer_norm(m_in , m_in.shape)
-                            audio_rep = mdl(source=m_in, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]                            
-                            audio_rep = [rep[0] for rep in audio_rep]
-                            audio_rep = torch.concatenate(audio_rep, dim=1).transpose(1, 0)
-                            audio_rep = audio_rep.cpu().numpy()
-                        audio_rep = skimage.measure.block_reduce(audio_rep, (1, 20, 1), np.mean) # downsample x20
-                        audio_rep = np.transpose(audio_rep, (1, 0, 2)) # [time, heads, width]
-                        feats.append(audio_rep)
-                    yield np.concatenate([np.expand_dims(feats[0], axis=1), 
-                                          np.expand_dims(feats[1], axis=1)], axis=1)
-                else:
-                    wav = wav.view(1, -1)
-                    with torch.no_grad():
-                        if cfg.task.normalize:
-                            wav = torch.nn.functional.layer_norm(wav , wav.shape)
-                        audio_rep = mdl(source=wav, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]
-                        audio_rep = [rep[0] for rep in audio_rep]
-                        audio_rep = torch.concatenate(audio_rep, dim=1).transpose(1, 0)
-                        audio_rep = audio_rep.cpu().numpy()
-                    audio_rep = skimage.measure.block_reduce(audio_rep, (1, 20, 1), np.mean) # downsample x20
-                    audio_rep = np.transpose(audio_rep, (1, 0, 2))
-                    yield audio_rep
+                    wav = torch.mean(wav, dim=1)    
+                wav = wav.view(1, -1)
+                with torch.no_grad():
+                    if cfg.task.normalize:
+                        wav = torch.nn.functional.layer_norm(wav , wav.shape)
+                    audio_rep = mdl(source=wav, mask=False, features_only=True, layer=cfg.model.encoder_layers)["layer_results"]
+                    audio_rep = [rep[0] for rep in audio_rep]
+                    audio_rep = torch.concatenate(audio_rep, dim=1).transpose(1, 0)
+                    audio_rep = audio_rep.cpu().numpy()
+                audio_rep = np.transpose(audio_rep, (1, 0, 2))
+                yield audio_rep
     return iterate, num
 
 
@@ -72,7 +56,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     def create_files(dest):
-        copyfile(os.path.join(args.data, args.split) + ".tsv", dest + ".tsv")
+        copyfile(os.path.join(args.data, args.split) + ".csv", dest + ".csv")
         if os.path.exists(os.path.join(args.data, args.split) + ".itl"):
             copyfile(os.path.join(args.data, args.split) + ".itl", dest + ".itl")
         if os.path.exists(os.path.join(args.data, args.split) + ".lis"):
@@ -83,7 +67,7 @@ def main():
         npaa = NpyAppendArray(dest + ".npy")
         return npaa
 
-    save_path = os.path.join(args.save_dir, args.split)
+    save_path = os.path.join(args.save_dir, "wav2vec."+args.split)
     npaa = create_files(save_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
