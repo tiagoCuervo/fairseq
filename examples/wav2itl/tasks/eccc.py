@@ -111,11 +111,7 @@ class ECCC(FairseqTask):
         corr = (
             sum(log.get("corr", zero) for log in logging_outputs)
         )
-        rmse = (
-            sum(log.get("rmse", zero) for log in logging_outputs)
-        )
         metrics.log_scalar("corr", corr)
-        metrics.log_scalar("rmse", rmse)
 
     def build_model(self, cfg: FairseqDataclass, from_checkpoint=False):
         model = super().build_model(cfg)

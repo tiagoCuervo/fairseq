@@ -20,32 +20,42 @@ N_FREQ_AUDIOGRAM = 8
 
 def pearsonr(x, y):
     # Calculate mean
-    mean_x = np.mean(x)
-    mean_y = np.mean(y)
+    mean_x = torch.mean(x)
+    mean_y = torch.mean(y)
 
     # Calculate covariance and variances
-    cov = np.mean((x - mean_x) * (y - mean_y))
-    var_x = np.var(x)
-    var_y = np.var(y)
+    cov = torch.mean((x - mean_x) * (y - mean_y))
+    var_x = torch.var(x)
+    var_y = torch.var(y)
 
     # Calculate Pearson correlation coefficient
-    pearson_corr = cov / (np.sqrt(var_x) * np.sqrt(var_y))
+    pearson_corr = cov / (torch.sqrt(var_x) * torch.sqrt(var_y))
 
     return pearson_corr
 
 entropy = lambda x: -sum(x*np.log(x))
 
-def continuousCTCLoss(logits, targets):
-    loss = 0
-    pred_confusions, resp_confusions = [], []
-    for logit, target in zip(logits, targets):
-        for freq, word in target:
-            ctc = F.ctc_loss(logit, torch.tensor(word), torch.tensor((len(logit),)), torch.tensor((len(word),)))
-            loss += freq * ctc
-        pred_confusions.append(max([entropy(F.sigmoid(l.cpu().detach())) for l in logit]))
-        resp_confusions.append(entropy([freq for freq, word in target]))
-    corr = pearsonr(pred_confusions, resp_confusions).statistic
-    return loss, corr
+
+ctc_loss = nn.CTCLoss(reduction='none', zero_infinity=True)
+# logit shape is (batch, time, codebook)
+# target shape is ~(batch, responses, phones)
+def continuousCTCLoss(logits, pred_lengths, targets):
+
+    pred_confidences = F.sigmoid(logits)
+    repeated_preds = pred_confidences.repeat_interleave(targets['n_responses'], dim=0)
+    repeated_pred_lengths = pred_lengths.repeat_interleave(targets['n_responses'], dim=0)
+    
+    ctc = ctc_loss(repeated_preds.transpose(1, 0), targets['responses'], repeated_pred_lengths, targets['lengths'])
+    ctc = (ctc * targets['freqs']).sum()
+
+    pred_confidences = pred_confidences.cpu().detach()
+    pred_entropies = (pred_confidences * torch.log(pred_confidences)).sum(axis=-1).max(-1)[0]
+    
+    target_entropies = targets['freqs'] * torch.log(targets['freqs'])
+    target_entropies = [-targets['freqs'][cumsum-n:cumsum].sum() for cumsum, n in zip(targets['n_responses'].cumsum(0), targets['n_responses'])]
+
+    corr = pearsonr(pred_entropies, torch.tensor(target_entropies))
+    return ctc, corr
         
 
 @dataclass
@@ -233,7 +243,6 @@ class Wav2itl(BaseFairseqModel):
         sample_size, max_seq_len, n_layers, inner_dim = features.size()
         
         x = self.dropout(self.lin_proj_1(features))
-        padding_mask = torch.repeat_interleave(padding_mask, n_layers, 0)
         down_inner_dim = x.size(-1)
         x = x.view((max_seq_len * sample_size, n_layers, down_inner_dim))
         # x = x.transpose(1, 2).reshape(-1, max_seq_len, down_inner_dim)
@@ -246,13 +255,13 @@ class Wav2itl(BaseFairseqModel):
         x = x[:, 0]
 
         x = x.view((sample_size, max_seq_len, down_inner_dim))
-        logits = self.pred(x)
+        logits = self.pred(x).log_softmax(-1)
 
         if self.huber_loss:
             preds = F.softmax(logits)
             loss = F.huber_loss(preds * 100, target * 100, reduction="sum")
         elif self.ctc_loss:
-            loss, corr = continuousCTCLoss(logits, target)
+            loss, corr = continuousCTCLoss(logits, padding_mask.sum(axis=-1), target)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, target, reduction="sum")
         result = {"losses": {"itl": loss}, "sample_size": sample_size, "corr":corr}

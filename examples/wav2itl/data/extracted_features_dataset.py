@@ -96,14 +96,11 @@ class ExtractedFeaturesDataset(FairseqDataset):
         res = {"id": index, "features": feats}
         if len(self.labels) > 0:
             responses, counts, tot = self.labels[index]
-            out = []
-            for r, c in zip(responses, counts):
-                out.append((int(c)/tot, [self.label_dict[ph] for ph in self.to_phoneme[r][0]]))
-            res["target"] = out
-            
-        
-        if self.aux_tgt:
-            res["aux_target"] = self.aux_tgt[index]
+            phones = torch.zeros((len(responses), self.max_label_length), dtype=int)
+            for i, response in enumerate(responses):
+                tr_response = [self.label_dict[phone] for phone in self.to_phoneme[response][0]]
+                phones[i, :len(tr_response)] = torch.tensor(tr_response)
+            res["target"] = {'responses':phones, 'freqs':np.array(counts).astype(int)/tot, 'lengths':(phones!=0).sum(axis=-1)}
 
         return res
 
@@ -121,7 +118,7 @@ class ExtractedFeaturesDataset(FairseqDataset):
         collated_features = features[0].new_zeros(
             len(features), target_size, *features[0].shape[-2:]
         )
-        padding_mask = torch.BoolTensor(collated_features.shape[:-1]).fill_(False)
+        padding_mask = torch.BoolTensor(collated_features.shape[:2]).fill_(False)
         for i, (f, size) in enumerate(zip(features, sizes)):
             collated_features[i, :size] = f
             padding_mask[i, size:] = True
@@ -132,15 +129,13 @@ class ExtractedFeaturesDataset(FairseqDataset):
         }
 
         if len(self.labels) > 0:
-            res['net_input']["target"] = [s['target'] for s in samples]
+            res['net_input']["target"] = {
+                'responses': torch.vstack([s['target']['responses'] for s in samples]),
+                'freqs': torch.concat([torch.tensor(s['target']['freqs']) for s in samples]),
+                'lengths': torch.concat([s['target']['lengths'] for s in samples]),
+                'n_responses': torch.tensor([len(s['target']['responses']) for s in samples], dtype=int)
+            }
         
-        if self.aux_tgt:
-            idxs = torch.nn.utils.rnn.pad_sequence(
-                [s["aux_target"] for s in samples],
-                batch_first=True,
-                padding_value=-1,
-            )
-            res["net_input"]["aux_target"] = idxs
         return res
 
     def num_tokens(self, index):
