@@ -1,6 +1,5 @@
-from .cpc2 import CPC2
-
+from .eccc import ECCC
 
 __all__ = [
-    "CPC2",
+    "ECCC"
 ]

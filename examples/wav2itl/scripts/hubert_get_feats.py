@@ -41,8 +41,9 @@ def get_iterator(args, mdl, cfg):
                 with torch.no_grad():
                     if cfg.task.normalize:
                         wav = torch.nn.functional.layer_norm(wav , wav.shape)
-                    audio_rep = mdl(source=wav, mask=False, features_only=True, output_layer=cfg.model.encoder_layers)['features']
-                    audio_rep = audio_rep.squeeze(0).cpu().numpy()
+                    audio_rep = mdl(source=wav, mask=False, features_only=True, output_layer=cfg.model.encoder_layers)['layer_results']
+                    audio_rep = [rep[0] for rep in audio_rep]
+                    audio_rep = torch.concatenate(audio_rep, dim=1).cpu().numpy()
                 yield audio_rep
     return iterate, num
 

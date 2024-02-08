@@ -8,14 +8,15 @@ common:
   reset_logging: false
   suppress_crashes: false
   wandb_project: "eccc"
-  wandb_entity: "indy-lis"
+  # wandb_entity: "indy-lis"
+  no_progress_bar: false
 
 checkpoint:
   save_interval: 1000
   save_interval_updates: 1000
   keep_interval_updates: 1
   no_epoch_checkpoints: true
-  best_checkpoint_metric: rmse
+  best_checkpoint_metric: corr
   save_dir: .
 
 distributed_training:
@@ -24,16 +25,16 @@ distributed_training:
 task:
   _name: eccc
   data: ???
-  labels: itl
+  labels: "csv"
   sort_by_length: false
   max_length: null
-  aux_feats_postfix: 
-    - lis
+  target_dictionary: "../dict.txt"
 
 dataset:
   num_workers: 0
-  batch_size: 160
+  batch_size: 16
   skip_invalid_size_inputs_valid_test: true
+  ignore_unused_valid_subsets: true
   valid_subset: valid
   validate_interval: 1000
   validate_interval_updates: 1000
@@ -42,7 +43,6 @@ criterion:
   _name: model
   log_keys:
     - corr
-    - rmse
 
 optimization:
   max_update: 80000
@@ -63,17 +63,18 @@ lr_scheduler:
 model:
   _name: wav2itl
 
-  in_dim: 1280
+  in_dim: 1024
   dim: 384
   causal: false
   depth: 1
   dropout: 0.1
   bias: false
+  out_dim: 69
   nhead: 6
   nhead_t: 1
   conv_pos_dim: 128
   conv_pos_groups: 16
   w_cross_attention: true
-  huber_loss: true
+  ctc_loss: true
   time_hier_transformer: true
-  avg_pool: true
+  avg_pool: false

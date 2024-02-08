@@ -5,7 +5,7 @@
 
 
 import logging
-import os
+import os, nltk
 import contextlib
 
 import numpy as np
@@ -25,32 +25,34 @@ class ExtractedFeaturesDataset(FairseqDataset):
         min_length=3,
         max_length=None,
         labels=None,
+        label_dict=None,
         shuffle=True,
         sort_by_length=True,
-        aux_feats_postfix=None,
+        aux_target_postfix=None,
     ):
         super().__init__()
-        # import ptvsd
-        # ptvsd.enable_attach(('0.0.0.0', 7310))
-        # print("Attach debugger now")
-        # ptvsd.wait_for_attach()
 
         self.min_length = min_length
         self.max_length = max_length
+        self.max_label_length = 12
         self.shuffle = shuffle
         self.sort_by_length = sort_by_length
+        self.label_dict = {l[0]:int(l[1]) for l in np.loadtxt(os.path.join(path, label_dict), delimiter=' ', dtype=str)}
+        if labels is not None:
+            assert label_dict is not None
 
         self.sizes = []
         self.offsets = []
         self.labels = []
-        self.aux_tgt = {}
+        self.aux_tgt = None
 
         path = os.path.join(path, split)
         data_path = path
         self.data = np.load(data_path + ".npy", mmap_mode="r")
 
-        offset = 0
         skipped = 0
+        offset = 0
+        self.to_phoneme = nltk.corpus.cmudict.dict()
 
         if not os.path.exists(path + f".{labels}"):
             labels = None
@@ -58,36 +60,32 @@ class ExtractedFeaturesDataset(FairseqDataset):
         with open(data_path + ".lengths", "r") as len_f, open(
             path + f".{labels}", "r"
         ) if labels is not None else contextlib.ExitStack() as lbl_f:
+            next(lbl_f)
             for line in len_f:
                 length = int(line.rstrip())
-                lbl = None if labels is None else next(lbl_f).rstrip().split()
+                lbl = None if labels is None else next(lbl_f).rstrip().split(',')
+                responses, counts, tot = lbl[9].split('|'), lbl[11].split(' '), int(lbl[10])
                 if length >= min_length and (
                     max_length is None or length <= max_length
-                ):
+                ) and np.all([r in self.to_phoneme for r in responses]):
+                    self.labels.append((responses, counts, tot))
                     self.sizes.append(length)
                     self.offsets.append(offset)
-                    if lbl is not None:
-                        self.labels.append(list(map(float, lbl)))
-                offset += length
-
-        self.sizes = np.asarray(self.sizes)
-        self.offsets = np.asarray(self.offsets)
-
-        if aux_feats_postfix is not None:
-            for postfix in aux_feats_postfix:
-                if not os.path.exists(path+f".{postfix}"):
-                    logger.info(f"auxaliry target for {split} missing")
+                    offset += length
                 else:
-                    # with open(path+f".{postfix}", "r") as t_f:
-                    #     self.aux_tgt[postfix] = [
-                    #         torch.Tensor(list(map(float,seg.strip().split())))\
-                    #                     for seg in t_f]
-                    with open(path + f".{postfix}", "r") as t_f:
-                        self.aux_tgt[postfix] = [
-                            torch.Tensor(list(map(lambda val: float(val)/100 if postfix == "lis" else float(val), seg.strip().split()))) \
-                            for seg in t_f
-                        ]
+                    skipped += 1
+                
+        self.sizes = np.asarray(self.sizes)
         
+        if aux_target_postfix is not None:
+            if not os.path.exists(path+f".{aux_target_postfix}"):
+                logger.info(f"auxaliry target for {split} missing")
+            else:
+                with open(path+f".{aux_target_postfix}", "r") as t_f:
+                    self.aux_tgt = [
+                        torch.LongTensor(list(map(int,seg.strip().split())))\
+                                    for seg in t_f]
+ 
         logger.info(f"loaded {len(self.offsets)}, skipped {skipped} samples")
 
     def __getitem__(self, index):
@@ -97,12 +95,16 @@ class ExtractedFeaturesDataset(FairseqDataset):
 
         res = {"id": index, "features": feats}
         if len(self.labels) > 0:
-            res["target"] = self.labels[index]
+            responses, counts, tot = self.labels[index]
+            out = []
+            for r, c in zip(responses, counts):
+                out.append((int(c)/tot, [self.label_dict[ph] for ph in self.to_phoneme[r][0]]))
+            res["target"] = out
+            
         
         if self.aux_tgt:
-            res["aux_feats"] = {}
-            for tgt in self.aux_tgt:
-                res["aux_feats"][tgt] = self.aux_tgt[tgt][index]
+            res["aux_target"] = self.aux_tgt[index]
+
         return res
 
     def __len__(self):
@@ -114,19 +116,12 @@ class ExtractedFeaturesDataset(FairseqDataset):
 
         features = [s["features"] for s in samples]
         sizes = [len(s) for s in features]
-
         target_size = max(sizes)
 
-        if features[0].dim() == 4:
-            collated_features = features[0].new_zeros(
-                len(features), target_size, 2, features[0].size(-2), features[0].size(-1) # We're using binaural signals from 32 Whisper layers
-            )
-            padding_mask = torch.BoolTensor(collated_features.shape[:-3]).fill_(False)
-        else:
-            collated_features = features[0].new_zeros(
-                len(features), target_size, 2, features[0].size(-1) # We're using binaural signals
-            )
-            padding_mask = torch.BoolTensor(collated_features.shape[:-2]).fill_(False)
+        collated_features = features[0].new_zeros(
+            len(features), target_size, *features[0].shape[-2:]
+        )
+        padding_mask = torch.BoolTensor(collated_features.shape[:-1]).fill_(False)
         for i, (f, size) in enumerate(zip(features, sizes)):
             collated_features[i, :size] = f
             padding_mask[i, size:] = True
@@ -137,19 +132,15 @@ class ExtractedFeaturesDataset(FairseqDataset):
         }
 
         if len(self.labels) > 0:
-            target = torch.Tensor([s["target"] for s in samples])
-            res["net_input"]["target"] = target
-
-        if self.aux_tgt:
-            res["net_input"]["aux_feats"] = {}
-            for tgt in self.aux_tgt:
-                idxs = torch.nn.utils.rnn.pad_sequence(
-                    [s["aux_feats"][tgt] for s in samples],
-                    batch_first=True,
-                    padding_value=-1,
-                )
-                res["net_input"]["aux_feats"][tgt] = idxs
+            res['net_input']["target"] = [s['target'] for s in samples]
         
+        if self.aux_tgt:
+            idxs = torch.nn.utils.rnn.pad_sequence(
+                [s["aux_target"] for s in samples],
+                batch_first=True,
+                padding_value=-1,
+            )
+            res["net_input"]["aux_target"] = idxs
         return res
 
     def num_tokens(self, index):

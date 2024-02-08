@@ -67,7 +67,7 @@ def main():
         npaa = NpyAppendArray(dest + ".npy")
         return npaa
 
-    save_path = os.path.join(args.save_dir, "wav2vec_robust."+args.split)
+    save_path = os.path.join(args.save_dir, "wav2vec_robust", args.split)
     npaa = create_files(save_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
