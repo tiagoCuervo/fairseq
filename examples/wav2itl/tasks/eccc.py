@@ -6,6 +6,8 @@ from typing import Optional, List
 import torch
 import torch.nn.functional as F
 
+from scipy import stats
+
 from fairseq.logging import metrics
 from fairseq.tasks import FairseqTask, register_task
 from ..data import ExtractedFeaturesDataset
@@ -31,9 +33,9 @@ class ECCCConfig(FairseqDataclass):
         default=None,
         metadata={"help": "extension of the label file to load, used for fine-tuning"},
     )
-    aux_feats_postfix: List[str] = field(
-        default_factory=list,
-        metadata={"help": "auxiliary features filename extensions"},
+    target_dictionary: Optional[str] = field(
+        default=None,
+        metadata={"help": ".txt file with label key to index associations"},
     )
     shuffle: bool = field(default=True, metadata={"help": "shuffle examples"})
     sort_by_length: bool = field(
@@ -49,7 +51,7 @@ class ECCC(FairseqTask):
     def __init__(
         self,
         cfg: ECCCConfig,
-        target_dictionary=None
+        target_dictionary="dict.txt"
     ):
         # import ptvsd
         # ptvsd.enable_attach(('0.0.0.0', 7310))
@@ -67,31 +69,15 @@ class ECCC(FairseqTask):
         optimizer.step()
 
     def valid_step(self, sample, model, criterion):
-        preds = model(
-            **sample["net_input"],
-            preds_only=True,
-        )
-        targets = sample["net_input"]["target"]
-        corr = pearsonr(preds.view(-1), targets.view(-1))
-        rmse = torch.sqrt((((preds * 100) - (targets * 100))**2).mean())
-        sample_size = len(preds)
-
-        try:
-            world_size = get_data_parallel_world_size()
-        except:
-            world_size = 1
-
+        res = model(**sample["net_input"])
+        # take the max prob of the least confident phoneme in the prediction, and correlate to the max response frequency 
         logging_output = {
-            "loss": corr,
-            "corr": corr,
-            "rmse": rmse,
-            "sample_size": sample_size,
-            "_nsamples": sample_size,
-            "_world_size": world_size,
-            "nsentences": sample_size,
+            "loss": res['losses']['itl'],
+            "corr": res['corr'],
+            "sample_size": res['sample_size']
         }
 
-        return corr, sample_size, logging_output
+        return res['losses']['itl'], res['sample_size'], logging_output
 
     def load_dataset(self, split: str, task_cfg: FairseqDataclass = None, **kwargs):
         data_path = self.cfg.data
@@ -103,9 +89,9 @@ class ECCC(FairseqTask):
             min_length=3,
             max_length=task_cfg.max_length,
             labels=task_cfg.labels,
+            label_dict=task_cfg.target_dictionary,
             shuffle=getattr(task_cfg, "shuffle", True),
             sort_by_length=task_cfg.sort_by_length,
-            aux_feats_postfix=task_cfg.aux_feats_postfix
         )
 
     @property

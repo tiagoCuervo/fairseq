@@ -20,18 +20,33 @@ N_FREQ_AUDIOGRAM = 8
 
 def pearsonr(x, y):
     # Calculate mean
-    mean_x = torch.mean(x)
-    mean_y = torch.mean(y)
+    mean_x = np.mean(x)
+    mean_y = np.mean(y)
 
     # Calculate covariance and variances
-    cov = torch.mean((x - mean_x) * (y - mean_y))
-    var_x = torch.var(x)
-    var_y = torch.var(y)
+    cov = np.mean((x - mean_x) * (y - mean_y))
+    var_x = np.var(x)
+    var_y = np.var(y)
 
     # Calculate Pearson correlation coefficient
-    pearson_corr = cov / (torch.sqrt(var_x) * torch.sqrt(var_y))
+    pearson_corr = cov / (np.sqrt(var_x) * np.sqrt(var_y))
 
     return pearson_corr
+
+entropy = lambda x: -sum(x*np.log(x))
+
+def continuousCTCLoss(logits, targets):
+    loss = 0
+    pred_confusions, resp_confusions = [], []
+    for logit, target in zip(logits, targets):
+        for freq, word in target:
+            ctc = F.ctc_loss(logit, torch.tensor(word), torch.tensor((len(logit),)), torch.tensor((len(word),)))
+            loss += freq * ctc
+        pred_confusions.append(max([entropy(F.sigmoid(l.cpu().detach())) for l in logit]))
+        resp_confusions.append(entropy([freq for freq, word in target]))
+    corr = pearsonr(pred_confusions, resp_confusions).statistic
+    return loss, corr
+        
 
 @dataclass
 class Wav2itl_Config(FairseqDataclass):
@@ -42,12 +57,14 @@ class Wav2itl_Config(FairseqDataclass):
     depth: int = 1
     dropout: float = 0.1
     bias: bool = False
+    out_dim: int = 42
     nhead: int = 6
     nhead_t: int = 1
     conv_pos_dim: int = 128
     conv_pos_groups: int = 16
     w_cross_attention: bool = True
-    huber_loss: bool = True
+    huber_loss: bool = False
+    ctc_loss: bool = False
     time_hier_transformer: bool = True
     avg_pool: bool = True
 
@@ -145,7 +162,7 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class BinauralBlock(nn.Module):
+class TransformerBlock(nn.Module):
 
     def __init__(self, dim, n_head, bias, dropout, causal, w_cross_attention):
         super().__init__()
@@ -160,15 +177,9 @@ class BinauralBlock(nn.Module):
         self.mlp = MLP(dim, bias, dropout)
 
     def forward(self, x):
-        x_l, x_r = x
-        x_l = x_l + self.attn(self.ln_1(x_l))
-        x_r = x_r + self.attn(self.ln_1(x_r))
-        if self.w_cross_attention:
-            x_l = x_l + self.cross_attn((self.ln_cross_attn_q(x_l), self.ln_cross_attn_kv(x_r)))
-            x_r = x_r + self.cross_attn((self.ln_cross_attn_q(x_r), self.ln_cross_attn_kv(x_l)))
-        x_l = x_l + self.mlp(self.ln_2(x_l))
-        x_r = x_r + self.mlp(self.ln_2(x_r))
-        return (x_l, x_r)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 
 @register_model("wav2itl", dataclass=Wav2itl_Config)
@@ -193,29 +204,17 @@ class Wav2itl(BaseFairseqModel):
         self.lin_proj_1 = nn.Linear(cfg.in_dim, inner_dim, bias=False)
         self.dropout = nn.Dropout(cfg.dropout)
         self.multi_layer_features = cfg.time_hier_transformer
-        if cfg.time_hier_transformer:
-            self.temporal_transformer = BinauralBlock(inner_dim, cfg.nhead_t, cfg.bias, cfg.dropout, cfg.causal, cfg.w_cross_attention)
-            self.layer_transformer = BinauralBlock(inner_dim, cfg.nhead, cfg.bias, cfg.dropout, cfg.causal, cfg.w_cross_attention)
-            # self.temporal_transformer = nn.Sequential(*[BinauralBlock(inner_dim, cfg.nhead_t, cfg.bias, 
-            #                                                 cfg.dropout, cfg.causal, cfg.w_cross_attention) 
-            #                                                 for _ in range(cfg.depth)])
-            # self.layer_transformer = nn.Sequential(*[BinauralBlock(inner_dim, cfg.nhead, cfg.bias, 
-            #                                                 cfg.dropout, cfg.causal, cfg.w_cross_attention) 
-            #                                                 for _ in range(cfg.depth)])
-            self.ln_f_t = LayerNorm(inner_dim, bias=cfg.bias)
-            self.ln_f_l = LayerNorm(inner_dim, bias=cfg.bias)
-        else:
-            self.pos_enc = ConvPositionalEncoding(inner_dim, cfg.conv_pos_dim, cfg.conv_pos_groups)
-            self.transformer_blocks = nn.Sequential(*[BinauralBlock(inner_dim, cfg.nhead, cfg.bias, 
-                                                            cfg.dropout, cfg.causal, cfg.w_cross_attention) 
-                                                            for _ in range(cfg.depth)])
+        self.layer_transformer = TransformerBlock(inner_dim, cfg.nhead, cfg.bias, cfg.dropout, cfg.causal, cfg.w_cross_attention)
+        
+        self.ln_f_t = LayerNorm(inner_dim, bias=cfg.bias)
+        self.ln_f_l = LayerNorm(inner_dim, bias=cfg.bias)
+
         self.ln_f = LayerNorm(inner_dim, bias=cfg.bias)
         # Merge, pool and predict
-        self.merge_layer = nn.Linear(inner_dim * 2, inner_dim)
-        self.pred = nn.Linear(inner_dim, 1, bias=cfg.bias)
+        self.pred = nn.Linear(inner_dim, cfg.out_dim, bias=cfg.bias)
         # Aux features input
         self.lis_data_net = nn.Linear(N_FREQ_AUDIOGRAM, inner_dim)
-        self.huber_loss = cfg.huber_loss
+        self.huber_loss, self.ctc_loss = cfg.huber_loss, cfg.ctc_loss
 
         self.avg_pool = cfg.avg_pool
         if not self.avg_pool:
@@ -229,99 +228,32 @@ class Wav2itl(BaseFairseqModel):
         self,
         features,
         padding_mask,
-        target=None,
-        preds_only=False,
-        aux_feats=None,
+        target,
     ):
-        if self.multi_layer_features:
-            sample_size, max_seq_len, n_audio_channels, n_layers, inner_dim = features.size()
-        else:
-            sample_size, max_seq_len, n_audio_channels, inner_dim = features.size()
-        l_features, r_features = features.split(1, dim=2)
-        if self.multi_layer_features:
-            x_l = self.dropout(self.lin_proj_1(l_features.squeeze(2)))
-            x_r = self.dropout(self.lin_proj_1(r_features.squeeze(2)))
-            padding_mask = torch.repeat_interleave(padding_mask, n_layers, 0)
-            down_inner_dim = x_l.size(-1)
-            # At this point feats are of size: sample_size x max_seq_len x n_layers x down_inner_dim
-            x_l = x_l.transpose(1, 2).reshape(-1, max_seq_len, down_inner_dim)
-            x_r = x_r.transpose(1, 2).reshape(-1, max_seq_len, down_inner_dim)
-            x_l, x_r = self.temporal_transformer((x_l, x_r))
-            x_l = self.ln_f_t(x_l)
-            x_r = self.ln_f_t(x_r)
-            # At this point feats are of size: (sample_size * n_layers) x max_seq_len x down_inner_dim
-            # We do average pooling across time
-            x_l[padding_mask] = 0
-            x_r[padding_mask] = 0
-            x_sz = features.size(1) - padding_mask.sum(dim=-1, keepdim=True)
-            x_l = x_l.sum(dim=1) / x_sz
-            x_r = x_r.sum(dim=1) / x_sz
-            # At this point feats are of size: (sample_size * n_layers) x down_inner_dim
-            x_l = x_l.view(sample_size, n_layers, down_inner_dim)
-            x_r = x_r.view(sample_size, n_layers, down_inner_dim)
-            l_seq_len = n_layers
-            if aux_feats is not None:
-                if "lis" in aux_feats:
-                    l_lis_features, r_lis_features = aux_feats["lis"].split(aux_feats["lis"].size(-1) // 2, dim=1)
-                    lis_l = self.lis_data_net(l_lis_features)
-                    lis_r = self.lis_data_net(r_lis_features)
-                    x_l = torch.cat([lis_l.unsqueeze(1), x_l], dim=1)
-                    x_r = torch.cat([lis_r.unsqueeze(1), x_r], dim=1)
-                    l_seq_len += 1
-            if self.avg_pool:
-                x_l, x_r = self.layer_transformer((x_l, x_r))
-                x_l = self.ln_f_l(x_l)
-                x_r = self.ln_f_l(x_r)
-                x_l = x_l.sum(dim=1) / l_seq_len
-                x_r = x_r.sum(dim=1) / l_seq_len
-            else:
-                x_l = torch.cat([self.cls_token.view(1, 1, -1).repeat((sample_size, 1, 1)), x_l], dim=1)
-                x_r = torch.cat([self.cls_token.view(1, 1, -1).repeat((sample_size, 1, 1)), x_r], dim=1)
-                x_l, x_r = self.layer_transformer((x_l, x_r))
-                x_l = self.ln_f_l(x_l)
-                x_r = self.ln_f_l(x_r)
-                x_l = x_l[:, 0]
-                x_r = x_r[:, 0]
-        else:
-            x_l = self.dropout(self.pos_enc(self.lin_proj_1(l_features.squeeze(2))))
-            x_r = self.dropout(self.pos_enc(self.lin_proj_1(r_features.squeeze(2)))) 
-            seq_offset = 0
-            if aux_feats is not None:
-                if "lis" in aux_feats:
-                    l_lis_features, r_lis_features = aux_feats["lis"].split(aux_feats["lis"].size(-1) // 2, dim=1)
-                    lis_l = self.lis_data_net(l_lis_features)
-                    lis_r = self.lis_data_net(r_lis_features)
-                    x_l = torch.cat([lis_l.unsqueeze(1), x_l], dim=1)
-                    x_r = torch.cat([lis_r.unsqueeze(1), x_r], dim=1)
-                    seq_offset = 1
-            x_l, x_r = self.transformer_blocks((x_l, x_r))
-            x_l = self.ln_f(x_l[:, seq_offset:])
-            x_r = self.ln_f(x_r[:, seq_offset:])
-            x_l[padding_mask] = 0
-            x_r[padding_mask] = 0
-            x_sz = features.size(1) - padding_mask.sum(dim=-1, keepdim=True)
-            x_l = x_l.sum(dim=1) / x_sz
-            x_r = x_r.sum(dim=1) / x_sz
-        x = torch.cat([x_l, x_r], dim=-1)
-        x = self.merge_layer(x)
-        logits = self.pred(x)
-        preds = F.sigmoid(logits)
+        sample_size, max_seq_len, n_layers, inner_dim = features.size()
+        
+        x = self.dropout(self.lin_proj_1(features))
+        padding_mask = torch.repeat_interleave(padding_mask, n_layers, 0)
+        down_inner_dim = x.size(-1)
+        x = x.view((max_seq_len * sample_size, n_layers, down_inner_dim))
+        # x = x.transpose(1, 2).reshape(-1, max_seq_len, down_inner_dim)
+        # At this point feats are of size: (batch_size * max_seq_len) x n_layers x down_inner_dim
+        l_seq_len = n_layers
 
-        if preds_only:
-            return preds
+        x = torch.cat([self.cls_token.view(1, 1, -1).repeat((sample_size*max_seq_len, 1, 1)), x], dim=1)
+        x = self.layer_transformer(x)
+        x = self.ln_f_l(x)
+        x = x[:, 0]
+
+        x = x.view((sample_size, max_seq_len, down_inner_dim))
+        logits = self.pred(x)
+
         if self.huber_loss:
+            preds = F.softmax(logits)
             loss = F.huber_loss(preds * 100, target * 100, reduction="sum")
+        elif self.ctc_loss:
+            loss, corr = continuousCTCLoss(logits, target)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, target, reduction="sum")
-        with torch.no_grad():
-            corr = pearsonr(preds.view(-1), target.view(-1))
-            rmse = torch.sqrt((((preds * 100) - (target * 100))**2).mean())
-        result = {
-            "losses": {
-                "itl": loss
-            },
-            "sample_size": sample_size,
-            "corr": corr,
-            "rmse": rmse
-        }
+        result = {"losses": {"itl": loss}, "sample_size": sample_size, "corr":corr}
         return result
