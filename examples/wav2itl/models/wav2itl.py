@@ -41,18 +41,17 @@ ctc_loss = nn.CTCLoss(reduction='none', zero_infinity=True)
 # target shape is ~(batch, responses, phones)
 def continuousCTCLoss(logits, pred_lengths, targets):
 
-    pred_confidences = F.sigmoid(logits)
-    repeated_preds = pred_confidences.repeat_interleave(targets['n_responses'], dim=0)
+    repeated_preds = logits.log_softmax(-1).repeat_interleave(targets['n_responses'], dim=0)
     repeated_pred_lengths = pred_lengths.repeat_interleave(targets['n_responses'], dim=0)
-    
+
     ctc = ctc_loss(repeated_preds.transpose(1, 0), targets['responses'], repeated_pred_lengths, targets['lengths'])
     ctc = (ctc * targets['freqs']).sum()
 
-    pred_confidences = pred_confidences.cpu().detach()
-    pred_entropies = (pred_confidences * torch.log(pred_confidences)).sum(axis=-1).max(-1)[0]
+    pred_confidences = logits.softmax(-1).cpu().detach()
+    pred_entropies = (-(pred_confidences * torch.log(pred_confidences)).sum(axis=-1)).max(-1)[0]
     
     target_entropies = targets['freqs'] * torch.log(targets['freqs'])
-    target_entropies = [-targets['freqs'][cumsum-n:cumsum].sum() for cumsum, n in zip(targets['n_responses'].cumsum(0), targets['n_responses'])]
+    target_entropies = [-target_entropies[cumsum-n:cumsum].sum() for cumsum, n in zip(targets['n_responses'].cumsum(0), targets['n_responses'])]
 
     corr = pearsonr(pred_entropies, torch.tensor(target_entropies))
     return ctc, corr
@@ -255,7 +254,7 @@ class Wav2itl(BaseFairseqModel):
         x = x[:, 0]
 
         x = x.view((sample_size, max_seq_len, down_inner_dim))
-        logits = self.pred(x).log_softmax(-1)
+        logits = self.pred(x)
 
         if self.huber_loss:
             preds = F.softmax(logits)
